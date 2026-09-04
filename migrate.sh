@@ -1,10 +1,11 @@
 #!/bin/bash
 # ============================================================
 # Zimbra Migration Script
-# Version: 1.1.1
-# Last Modified: 2026-07-08
+# Version: 1.2.0
+# Last Modified: 2026-09-04
+# Note: curl cannot set start time
 # ============================================================
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.2.0"
 
 export ACTION=$1
 export DOMAIN=$2
@@ -12,6 +13,25 @@ export USERNAME=$(whoami)
 export BASE_DIR="/opt/zimbra/backup"
 export BACKUP_DIR="$BASE_DIR/$DOMAIN"
 export LOG_FILE="/opt/zimbra/log/zimbramigration.log"
+export ZIMBRA_ADMIN_USER="${ZIMBRA_ADMIN_USER:-}"
+export ZIMBRA_ADMIN_PASSWORD="${ZIMBRA_ADMIN_PASSWORD:-}"
+export ZIMBRA_HOST="${ZIMBRA_HOST:-localhost}"
+
+prompt_admin_credentials() {
+    if [ -z "$ZIMBRA_ADMIN_USER" ]; then
+        echo "Enter Zimbra Admin Username:"
+        read ZIMBRA_ADMIN_USER
+    fi
+    if [ -z "$ZIMBRA_ADMIN_PASSWORD" ]; then
+        echo "Enter Zimbra Admin Password:"
+        read -s ZIMBRA_ADMIN_PASSWORD
+        echo ""
+    fi
+    if [ -z "$ZIMBRA_ADMIN_USER" ] || [ -z "$ZIMBRA_ADMIN_PASSWORD" ]; then
+        echo "Zimbra Admin username and password are required for curl method"
+        exit 1
+    fi
+}
 
 # Subdirectory constants (single source of truth)
 DIR_ADMIN="admin.txt"
@@ -72,6 +92,24 @@ backup() {
         exit 1
     fi
     echo "Domain $DOMAIN found"
+    echo "Select mailbox backup method:"
+    echo "1) zmmailbox"
+    echo "2) curl"
+    echo "Note: curl cannot set start time"
+    echo "Choose method (1/2 or zmmailbox/curl) [default: 1]:"
+    read BACKUP_METHOD
+    BACKUP_METHOD=$(echo "$BACKUP_METHOD" | tr '[:upper:]' '[:lower:]')
+    if [ -z "$BACKUP_METHOD" ] || [ "$BACKUP_METHOD" == "1" ] || [ "$BACKUP_METHOD" == "zmmailbox" ]; then
+        BACKUP_METHOD="zmmailbox"
+    elif [ "$BACKUP_METHOD" == "2" ] || [ "$BACKUP_METHOD" == "curl" ]; then
+        BACKUP_METHOD="curl"
+        echo "Note: curl cannot set start time"
+        prompt_admin_credentials
+    else
+        echo "Invalid backup method. Please enter '1'/'zmmailbox' or '2'/'curl'"
+        exit 1
+    fi
+
     echo "Do you want to compress the backup files after backup process? (y/n)"
     read COMPRESS
     if [[ ! "$COMPRESS" =~ ^[yn]$ ]]; then
@@ -114,9 +152,14 @@ backup() {
     echo "Get all mailbox"
     mkdir -p "$BACKUP_DIR/$DIR_MAILBOX"
     for email in $(cat "$BACKUP_DIR/$DIR_EMAILS"); do
-        zmmailbox -z -m $email getRestURL '/?fmt=tgz' > "$BACKUP_DIR/$DIR_MAILBOX/$email.tgz"
+        if [ "$BACKUP_METHOD" == "curl" ]; then
+            # Note: curl cannot set start time
+            curl -s -S -k -u "$ZIMBRA_ADMIN_USER:$ZIMBRA_ADMIN_PASSWORD" "https://$ZIMBRA_HOST:7071/service/home/$email/?fmt=tgz" -o "$BACKUP_DIR/$DIR_MAILBOX/$email.tgz"
+        else
+            zmmailbox -z -m $email getRestURL '/?fmt=tgz' > "$BACKUP_DIR/$DIR_MAILBOX/$email.tgz"
+        fi
         #for delta to re sync mailbox
-        #use this instead
+        #use this instead (Note: curl cannot set start time, delta sync requires zmmailbox)
         #zmmailbox -z -m $email getRestURL '/?fmt=tgz&start=1754413200000' > "$BACKUP_DIR/$DIR_MAILBOX/$email.tgz"
         #it uses epoch time
         echo "Mailbox downloaded for .... $email"
@@ -206,6 +249,22 @@ restore() {
         exit 1
     fi
     echo "Domain $DOMAIN found"
+    echo "Select mailbox restore method:"
+    echo "1) zmmailbox"
+    echo "2) curl"
+    echo "Choose method (1/2 or zmmailbox/curl) [default: 1]:"
+    read RESTORE_METHOD
+    RESTORE_METHOD=$(echo "$RESTORE_METHOD" | tr '[:upper:]' '[:lower:]')
+    if [ -z "$RESTORE_METHOD" ] || [ "$RESTORE_METHOD" == "1" ] || [ "$RESTORE_METHOD" == "zmmailbox" ]; then
+        RESTORE_METHOD="zmmailbox"
+    elif [ "$RESTORE_METHOD" == "2" ] || [ "$RESTORE_METHOD" == "curl" ]; then
+        RESTORE_METHOD="curl"
+        prompt_admin_credentials
+    else
+        echo "Invalid restore method. Please enter '1'/'zmmailbox' or '2'/'curl'"
+        exit 1
+    fi
+
     echo "Restoring $DOMAIN"
 
     USERPASS="$BACKUP_DIR/$DIR_USERPASS"
@@ -233,7 +292,11 @@ restore() {
 
     echo "Restoring mailbox"
     for i in $(cat "$BACKUP_DIR/$DIR_EMAILS"); do
-        zmmailbox -z -m $i postRestURL "/?fmt=tgz&resolve=skip" "$BACKUP_DIR/$DIR_MAILBOX/$i.tgz"
+        if [ "$RESTORE_METHOD" == "curl" ]; then
+            curl -s -S -k -u "$ZIMBRA_ADMIN_USER:$ZIMBRA_ADMIN_PASSWORD" --data-binary "@$BACKUP_DIR/$DIR_MAILBOX/$i.tgz" "https://$ZIMBRA_HOST:7071/service/home/$i/?fmt=tgz&resolve=skip"
+        else
+            zmmailbox -z -m $i postRestURL "/?fmt=tgz&resolve=skip" "$BACKUP_DIR/$DIR_MAILBOX/$i.tgz"
+        fi
         echo "$i -- finished "
     done
     echo "Restore Mailbox Completed"
@@ -319,6 +382,7 @@ restore() {
 
 backup-delta() {
     echo "[v$SCRIPT_VERSION] Starting delta backup for $DOMAIN"
+    echo "Note: curl cannot set start time. Delta backup uses zmmailbox."
     echo "Please enter the epoch time"
     echo "Example: 1754913600"
     echo "Get epoch time from https://www.epochconverter.com/"
@@ -330,6 +394,7 @@ backup-delta() {
     echo "Get all mailbox"
     mkdir -p "$BACKUP_DIR/$DIR_DELTA"
     for email in $(cat "$BACKUP_DIR/$DIR_EMAILS"); do
+        # Note: curl cannot set start time, zmmailbox is used for delta sync
         zmmailbox -z -m $email getRestURL "/?fmt=tgz&start=$EPOCH_TIME" > "$BACKUP_DIR/$DIR_DELTA/$email.tgz"
         echo "Mailbox downloaded for .... $email"
     done
@@ -350,9 +415,30 @@ restore-delta() {
         echo "Please extract the delta backup files to $BASE_DIR/$DOMAIN/$DIR_DELTA/"
         exit 1
     fi
+
+    echo "Select mailbox restore method:"
+    echo "1) zmmailbox"
+    echo "2) curl"
+    echo "Choose method (1/2 or zmmailbox/curl) [default: 1]:"
+    read RESTORE_METHOD
+    RESTORE_METHOD=$(echo "$RESTORE_METHOD" | tr '[:upper:]' '[:lower:]')
+    if [ -z "$RESTORE_METHOD" ] || [ "$RESTORE_METHOD" == "1" ] || [ "$RESTORE_METHOD" == "zmmailbox" ]; then
+        RESTORE_METHOD="zmmailbox"
+    elif [ "$RESTORE_METHOD" == "2" ] || [ "$RESTORE_METHOD" == "curl" ]; then
+        RESTORE_METHOD="curl"
+        prompt_admin_credentials
+    else
+        echo "Invalid restore method. Please enter '1'/'zmmailbox' or '2'/'curl'"
+        exit 1
+    fi
+
     echo "Restoring mailbox"
     for i in $(cat "$BACKUP_DIR/$DIR_EMAILS"); do
-        zmmailbox -z -m $i postRestURL "/?fmt=tgz&resolve=skip" "$BACKUP_DIR/$DIR_DELTA/$i.tgz"
+        if [ "$RESTORE_METHOD" == "curl" ]; then
+            curl -s -S -k -u "$ZIMBRA_ADMIN_USER:$ZIMBRA_ADMIN_PASSWORD" --data-binary "@$BACKUP_DIR/$DIR_DELTA/$i.tgz" "https://$ZIMBRA_HOST:7071/service/home/$i/?fmt=tgz&resolve=skip"
+        else
+            zmmailbox -z -m $i postRestURL "/?fmt=tgz&resolve=skip" "$BACKUP_DIR/$DIR_DELTA/$i.tgz"
+        fi
         echo "$i -- finished "
     done
     echo "Restore Mailbox Delta Completed"
