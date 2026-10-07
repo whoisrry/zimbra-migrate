@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.4.0] - 2026-10-08
+
+### feat
+- `backup` and `restore` ask for a scope: `1) accounts` (accounts, passwords, aliases, forwarding, signatures, filters, distribution lists, no mailbox), `2) mailbox` (mailbox content only) or `3) all` (default, same as before). Accounts can be migrated first and mailboxes later.
+- accounts-only backup is archived as `<domain>-accounts.tar.gz` (mailbox directory excluded).
+- mailbox-only backup is archived as `<domain>-mailbox.tar` without gzip, because the mailbox `.tgz` files are already compressed.
+- mailbox backup writes its own start time to `mailbox/backup_version.txt`; `backup-delta` uses it as the default epoch.
+- mailbox restore derives the account list from the `.tgz` archives when `emails.txt` is missing.
+- each backup refreshes `emails.txt`, so a mailbox backup includes accounts created after the accounts backup.
+
+### perf
+- backup account data and distribution list members through `zmprov` batch sessions (one JVM for all accounts) instead of one `zmprov` process per account.
+- restore accounts, passwords, aliases, forwarding addresses, distribution lists and members through `zmprov` batch sessions. Only accounts that have a signature or filter (multi-line values) still need their own `zmprov` calls.
+- with `JOBS=N`, accounts are split across `N` batch sessions running in parallel.
+
+### fix
+- accounts missing from batch output are retried one by one: on backup, accounts without output files; on restore, accounts not found on the target after the batch.
+
 ## [1.3.0] - 2026-10-07
 
 ### perf

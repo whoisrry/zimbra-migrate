@@ -2,20 +2,44 @@
 
 ## Migration Flow
 
-1. **Full backup (source)**: `JOBS=4 ./migrate.sh backup contoh.com`
+Large domains (hundreds of users) are best migrated in two stages: accounts first, then mailboxes. Accounts take seconds to minutes. Mailboxes can take hours and can be copied while users keep working on the source server.
+
+`backup` and `restore` both ask for a scope:
+
+```
+Select backup scope:
+1) accounts  - accounts, passwords, aliases, forwarding, signatures, filters, distribution lists (no mailbox)
+2) mailbox   - mailbox content only
+3) all       - accounts and mailbox
+Choose scope (1/2/3 or accounts/mailbox/all) [default: 3]:
+```
+
+### Stage 1: accounts
+1. **Source**: `JOBS=4 ./migrate.sh backup contoh.com` → scope `1`.
    - Verifies the domain exists (exact match).
-   - Asks for the mailbox method and whether to compress.
-   - Writes `backup_version.txt` (script version, start date, start epoch).
-   - Exports account lists, distribution lists, account data and mailboxes.
-2. **Transfer**: copy `contoh.com-backup.tar.gz` to the target and extract it into `/opt/zimbra/backup/`.
-3. **Restore (target)**: `JOBS=4 ./migrate.sh restore contoh.com`
-   - Offers to create the domain if it is missing, then continues.
-   - Restores in phases: accounts → mailboxes → alias/signature/filter/forwarding → distribution lists → list members.
+   - Writes `backup_version.txt`, `emails.txt`, `admin.txt`, distribution lists and the per-account files.
+   - With compression: `contoh.com-accounts.tar.gz` (the `mailbox/` directory is excluded).
+2. **Transfer**: copy the archive and extract it into `/opt/zimbra/backup/` on the target.
+3. **Target**: `JOBS=4 ./migrate.sh restore contoh.com` → scope `1`.
+   - Offers to create the domain if it is missing.
+   - Creates accounts with the original password hash, aliases, forwarding, signatures, filters, distribution lists and members.
+   - Does not ask to delete the backup, because the mailbox stage still needs the backup directory.
+
+### Stage 2: mailboxes
+4. **Source**: `JOBS=4 ./migrate.sh backup contoh.com` → scope `2`, then the method (`zmmailbox` or `curl`).
+   - Refreshes `emails.txt` and writes `mailbox/backup_version.txt` with the mailbox backup start time.
+   - With compression: `contoh.com-mailbox.tar` (not gzip again; the `.tgz` files are already compressed).
+5. **Transfer**: copy and extract with `tar -C /opt/zimbra/backup -xf contoh.com-mailbox.tar`.
+6. **Target**: `JOBS=4 ./migrate.sh restore contoh.com` → scope `2`.
+   - Imports every `mailbox/<account>.tgz`. If `emails.txt` is missing, the account list comes from the archive file names.
    - Asks whether to delete the backup directory at the end.
-4. **Cutover**: switch MX/DNS to the target server.
-5. **Delta backup (source)**: `./migrate.sh backup-delta contoh.com`
-   - Press Enter to use the full backup start time, or type an epoch in seconds or milliseconds.
-6. **Delta restore (target)**: extract `contoh.com-backup-delta.tar.gz` into `/opt/zimbra/backup/`, then `./migrate.sh restore-delta contoh.com`.
+
+### Stage 3: cutover
+7. Switch MX/DNS to the target server.
+8. **Source**: `./migrate.sh backup-delta contoh.com`. Press Enter to use the mailbox backup start time, or type an epoch in seconds or milliseconds.
+9. **Target**: extract `contoh.com-backup-delta.tar.gz` into `/opt/zimbra/backup/`, then `./migrate.sh restore-delta contoh.com`.
+
+Scope `3` (all) runs both stages in one go, the same as versions before 1.4.0.
 
 ## Mailbox Backup & Restore Methods
 
@@ -23,11 +47,13 @@
 - **`zmmailbox`**: Native Zimbra CLI tool executed as the `zimbra` system user. Supports delta synchronization using start epoch timestamps.
 - **`curl`**: REST API call over HTTPS (port 7071) authenticated with admin credentials. Credentials are passed through a config file descriptor, so the password is not visible in `ps`.
 
+The method is only asked when the scope includes mailboxes.
+
 > [!NOTE]
 > `curl` cannot set start time on mailbox exports. For delta backups filtering by start timestamp, `zmmailbox` must be used.
 
 > [!IMPORTANT]
-> The REST `start` parameter is in **milliseconds**. Since v1.3.0 `backup-delta` converts a seconds value (10 digits or fewer) automatically. Before v1.3.0 a seconds value was read as a 1970 timestamp, so the delta contained the whole mailbox.
+> The REST `start` parameter is in **milliseconds**. Since v1.3.0 `backup-delta` converts a seconds value (10 digits or fewer) automatically.
 
 ### Variables
 - `ZIMBRA_ADMIN_USER`: Zimbra administrator username (e.g. `admin@domain.com`).
@@ -38,32 +64,41 @@
 
 ## Performance
 
-### Fewer `zmprov` calls
-Each `zmprov` call starts a JVM (roughly 1–2 s), so the call count dominates the time spent outside mailbox transfers.
+### zmprov batch sessions
+Each `zmprov` process starts a JVM (roughly 1–2 s). With 400 accounts, one process per command adds up to tens of minutes of startup time alone. The accounts stage instead writes the commands to a file and feeds it to a single `zmprov` session (`zmprov < commands`), which runs all of them in one JVM.
 
-| Phase                          | v1.2.0 calls per account | v1.3.0 calls per account |
-| ------------------------------ | ------------------------ | ------------------------ |
-| Backup account data            | 7                        | 1                        |
-| Restore signature/filter/forward | 6 + 1 per forward      | 3                        |
-| Restore distribution list members | 1 per member          | 1 per list               |
+| Step                                      | v1.2.0 (per account)    | v1.4.0                                   |
+| ----------------------------------------- | ----------------------- | ---------------------------------------- |
+| Backup account data                       | 7 `zmprov` processes    | 1 batch session for all accounts         |
+| Backup distribution list members          | 1 process per list      | 1 batch session for all lists            |
+| Restore account + password + alias + forwarding | 2 + aliases + forwards | 1 batch session for all accounts   |
+| Restore signature + filter                | 6 processes             | 3 processes, only for accounts that have one |
+| Restore distribution lists + members      | 1 per list + 1 per member | 1 batch session                        |
 
-The backup uses one `zmprov -l ga <account> <attributes...>` call and splits the output with `awk` into the same files as before (`userpass/`, `userdata/`, `alias/`, `forward/`, `signature/`, `filter/`), so v1.3.0 can restore v1.2.0 backups and the other way around.
+The signature and sieve filter are restored per account because their multi-line values do not fit on a batch command line.
+
+The backup output is split with `awk` into the same files as before (`userpass/`, `userdata/`, `alias/`, `forward/`, `signature/`, `filter/`), so backups from older versions restore with v1.4.0 and the other way around.
 
 ### Parallel processing
-With `JOBS=N`, every per-account phase (account data, mailbox export/import, account creation, settings, distribution lists) runs `N` accounts at a time through `xargs -P`. Phases still run in order, so all accounts exist before mailboxes are imported, and all lists exist before members are added.
+With `JOBS=N`:
+- the accounts stage splits the accounts across `N` batch sessions. All commands for an account stay in the same session, so `ca` runs before `ma`/`aaa` for that account.
+- mailbox export/import and the per-account fallbacks run `N` accounts at a time through `xargs -P`.
+
+Steps still run in order: accounts → signature/filter → distribution lists → members, and mailboxes only after accounts.
 
 ## Error Handling
 
-- Mailbox exports are written to `<account>.tgz.part` and renamed only on success, so a failed export never leaves a file that looks valid.
-- Failed accounts are appended to `failed_mailbox_backup.txt`, `failed_mailbox_restore.txt`, `failed_mailbox_delta.txt` or `failed_mailbox_delta_restore.txt` in the backup directory, and a summary is logged at the end of the phase. The file is removed when nothing failed.
-- If the combined `zmprov ma` for signature/filter/forwarding fails, each setting is retried separately.
-- If a bulk `zmprov adlm` fails, each member is retried separately.
+- **Batch backup**: an account without output files after the batch is backed up again with its own `zmprov -l ga`. A distribution list without a member file is retried with its own `zmprov gdlm`.
+- **Batch restore**: batch `ERROR` lines are logged as `zmprov: ...`. After the batch, the accounts on the target are compared with `emails.txt`. Missing accounts are created again one by one, with their aliases, forwarding, signature and filter.
+- **Mailbox export**: data is written to `<account>.tgz.part` and renamed only on success, so a failed export never leaves a file that looks valid.
+- **Failed mailbox transfers** are written to `failed_mailbox_backup.txt`, `failed_mailbox_restore.txt`, `failed_mailbox_delta.txt` or `failed_mailbox_delta_restore.txt` in the backup directory, and a summary is logged. The file is removed when nothing failed.
+- If the combined `zmprov ma` for signature/filter fails, each setting is retried separately.
 
 ## Backup Directory Layout
 
 ```
 /opt/zimbra/backup/<domain>/
-├── backup_version.txt          # version, start date, start epoch (seconds)
+├── backup_version.txt          # accounts backup: version, start date, start epoch (seconds)
 ├── admin.txt                   # admin accounts (not restored automatically)
 ├── emails.txt                  # all accounts of the domain
 ├── distributionlist.txt
@@ -75,6 +110,7 @@ With `JOBS=N`, every per-account phase (account data, mailbox export/import, acc
 ├── signature/<account>.name
 ├── signature/<account>.signature
 ├── filter/<account>.filter
+├── mailbox/backup_version.txt  # mailbox backup start time (default for backup-delta)
 ├── mailbox/<account>.tgz
 ├── mailbox/delta/<account>.tgz
 └── failed_mailbox_*.txt        # only when transfers failed
