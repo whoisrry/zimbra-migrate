@@ -1,5 +1,40 @@
 # Changelog
 
+## [1.3.0] - 2026-10-07
+
+### perf
+- fetch all account data (password, user data, alias, forwarding, signature, filter) with a single `zmprov -l ga` call per account instead of seven separate `zmprov` calls; backup file layout is unchanged.
+- restore signature, filter and forwarding addresses with a single `zmprov ma` per account (falls back to one call per setting if the combined update fails).
+- add distribution list members with one `zmprov adlm` call per list (falls back to one call per member on failure).
+- add `JOBS` environment variable to process accounts in parallel for every per-account phase (default `1`, sequential).
+
+### feat
+- record failed mailbox transfers in `failed_mailbox_<phase>.txt` inside the backup directory and print a summary.
+- timestamp every log line and print the elapsed time of each action.
+- `backup-delta` offers the full backup start time (from `backup_version.txt`) as the default epoch and accepts seconds or milliseconds.
+- `restore-delta` derives the account list from the delta archives when `emails.txt` is missing (e.g. after the full backup was deleted).
+- `restore` continues after creating a missing domain instead of exiting.
+- `BASE_DIR`, `LOG_FILE` and `TMP_PASSWORD` can be overridden through environment variables.
+- back up and restore `sn` (surname).
+
+### fix
+- delta backup passed epoch seconds to the `start` parameter, which Zimbra reads as milliseconds, so every "delta" was a full export; seconds are now converted.
+- domain and distribution list lookups used substring `grep`, so `contoh.com` also matched `bcontoh.com`; matches are now exact.
+- restore set `cn` to the given name instead of the original common name.
+- restored names kept a leading space and were truncated at the first `:`.
+- failed mailbox downloads left partial `.tgz` files behind; downloads now go to a `.part` file and are only kept on success (`curl` now uses `--fail`).
+- restore skips accounts with no mailbox archive instead of posting an empty file.
+- passwords containing `\` were mangled by `read` without `-r`.
+- the log redirect ran before the user check, producing `tee` permission errors for non-`zimbra` users.
+
+### security
+- `curl` credentials are passed through a config file descriptor instead of `-u`, so the admin password no longer appears in `ps` output.
+- removed fixed temporary files under `/tmp` (`/tmp/signature`, `/tmp/name`, `/tmp/filter`, `/tmp/firmaid`).
+
+### refactor
+- deduplicate method selection, y/n prompts and usage output into helper functions.
+- quote all variables and use `tar -C` instead of `cd`.
+
 ## [1.2.0] - 2026-09-04
 
 ### feat
