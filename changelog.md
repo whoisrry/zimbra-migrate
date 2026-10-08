@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.4.1] - 2026-10-08
+
+### fix
+- restore and backup hung at "Restoring N account(s)": batch files were fed to `zmprov` on stdin, which opens the interactive `prov>` shell that reads the terminal. Batch sessions now use `zmprov -f <file>` with stdin from `/dev/null`.
+- `wait` now waits only for the batch sessions it started, never for the `tee` log process.
+- system accounts (GAL sync, spam/ham, quarantine) are excluded from backup via `zimbraIsSystemResource` / `zimbraIsSystemAccount`; restore skips `galsync*` accounts from older backups.
+- restore labels the accounts and mailbox version info separately and no longer logs "Domain found" right after creating it.
+
 ## [1.4.0] - 2026-10-08
 
 ### feat

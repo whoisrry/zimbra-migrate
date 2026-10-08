@@ -41,6 +41,13 @@ Choose scope (1/2/3 or accounts/mailbox/all) [default: 3]:
 
 Scope `3` (all) runs both stages in one go, the same as versions before 1.4.0.
 
+### System accounts
+GAL sync (`galsync*`), spam/ham training and virus quarantine accounts are not migrated: backup excludes accounts with `zimbraIsSystemResource` or `zimbraIsSystemAccount` set, and restore skips `galsync*` entries found in older backups. Recreate the GAL sync account on the target:
+
+```bash
+zmgsautil createAccount -a galsync@contoh.com -n InternalGAL --domain contoh.com -s $(zmhostname) -t zimbra -f _InternalGAL
+```
+
 ## Mailbox Backup & Restore Methods
 
 ### Methods Supported
@@ -65,7 +72,10 @@ The method is only asked when the scope includes mailboxes.
 ## Performance
 
 ### zmprov batch sessions
-Each `zmprov` process starts a JVM (roughly 1–2 s). With 400 accounts, one process per command adds up to tens of minutes of startup time alone. The accounts stage instead writes the commands to a file and feeds it to a single `zmprov` session (`zmprov < commands`), which runs all of them in one JVM.
+Each `zmprov` process starts a JVM (roughly 1–2 s). With 400 accounts, one process per command adds up to tens of minutes of startup time alone. The accounts stage instead writes the commands to a file and runs it in a single `zmprov` session (`zmprov -f <commands>`), which runs all of them in one JVM.
+
+> [!WARNING]
+> Batch files must be passed with `-f`. `zmprov < commands` opens the interactive `prov>` shell, which reads the terminal instead of stdin and hangs (fixed in v1.4.1).
 
 | Step                                      | v1.2.0 (per account)    | v1.4.0                                   |
 | ----------------------------------------- | ----------------------- | ---------------------------------------- |

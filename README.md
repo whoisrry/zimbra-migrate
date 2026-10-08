@@ -78,3 +78,4 @@ See [walkthrough.md](walkthrough.md) for a step-by-step migration guide, and [ch
 - Failed mailbox transfers are listed in `failed_mailbox_<phase>.txt` inside the backup directory.
 - Start with `JOBS=2`–`4` and watch server load; mailbox export/import is I/O and CPU heavy on the mailbox server.
 - Admin rights are not restored automatically. Admin accounts are listed in `admin.txt`; re-grant them with `zmprov ma <user> zimbraIsAdminAccount TRUE`.
+- System accounts (GAL sync, spam/ham, quarantine) are not migrated. Recreate GAL sync on the target with `zmgsautil createAccount` (see walkthrough.md).

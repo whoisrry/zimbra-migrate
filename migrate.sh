@@ -1,11 +1,11 @@
 #!/bin/bash
 # ============================================================
 # Zimbra Migration Script
-# Version: 1.4.0
+# Version: 1.4.1
 # Last Modified: 2026-10-08
 # Note: curl cannot set start time
 # ============================================================
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 
 export ACTION=$1
 export DOMAIN=${2,,}
@@ -180,8 +180,9 @@ domain_exists() {
     zmprov gad | grep -ixF "$DOMAIN" > /dev/null
 }
 
+# User accounts of the domain, without system accounts (GAL sync, spam/ham, quarantine)
 list_domain_accounts() {
-    zmprov -l sa "(&(objectClass=zimbraAccount)(mail=*@$DOMAIN))"
+    zmprov -l sa "(&(objectClass=zimbraAccount)(mail=*@$DOMAIN)(!(zimbraIsSystemResource=TRUE))(!(zimbraIsSystemAccount=TRUE)))"
 }
 
 # Write script version, start date and start epoch (seconds) to $1
@@ -193,25 +194,27 @@ write_version() {
     } > "$1"
 }
 
+# print_version_info <version_file> <label>
 print_version_info() {
     if [ -f "$1" ]; then
-        echo "Backup was created with script v$(sed -n '1p' "$1") on $(sed -n '2p' "$1")"
-        echo "Backup epoch timestamp: $(sed -n '3p' "$1") (use this for backup-delta)"
+        echo "$2 backup was created with script v$(sed -n '1p' "$1") on $(sed -n '2p' "$1")"
+        echo "$2 backup epoch timestamp: $(sed -n '3p' "$1") (use this for backup-delta)"
         echo "Current script version: v$SCRIPT_VERSION"
     else
         echo "WARNING: No version info found in backup. Backup may have been created with an older script version."
     fi
 }
 
-# Print a file listing the accounts to process: emails.txt, or one derived from the
-# *.tgz archives in $1 when emails.txt is missing
+# Print a file listing the accounts to restore: emails.txt, or one derived from the
+# *.tgz archives in $1 when emails.txt is missing. GAL sync accounts are skipped
+# (backups made before v1.4.1 include them); recreate them on the target with zmgsautil
 account_list() {
     if [ -s "$BACKUP_DIR/$DIR_EMAILS" ]; then
-        echo "$BACKUP_DIR/$DIR_EMAILS"
+        cat "$BACKUP_DIR/$DIR_EMAILS"
     else
-        find "$1" -maxdepth 1 -name '*.tgz' | sed 's#.*/##; s/\.tgz$//' > "$WORK_DIR/archive_accounts"
-        echo "$WORK_DIR/archive_accounts"
-    fi
+        find "$1" -maxdepth 1 -name '*.tgz' | sed 's#.*/##; s/\.tgz$//'
+    fi | grep '@' | grep -vi '^galsync[^@]*@' > "$WORK_DIR/accounts"
+    echo "$WORK_DIR/accounts"
 }
 
 # Report and keep the failure list of the current phase, or remove it when empty
@@ -242,15 +245,21 @@ run_each() {
 
 # Run each command file "$WORK_DIR/<name>.<n>" in its own zmprov batch session
 # (one JVM for many commands, sessions in parallel); output goes to function $2.
-# Remaining args are zmprov options (e.g. -l)
+# Remaining args are zmprov options (e.g. -l).
+# `-f` is required: without it zmprov opens its interactive shell, which reads the
+# terminal instead of stdin and hangs
 zmprov_batch() {
-    local name=$1 consumer=$2 f
+    local name=$1 consumer=$2 f pids=()
     shift 2
     for f in "$WORK_DIR/$name".[0-9]*; do
         [ -s "$f" ] || continue
-        zmprov "$@" < "$f" | "$consumer" &
+        zmprov "$@" -f "$f" < /dev/null | "$consumer" &
+        pids+=($!)
     done
-    wait
+    # Wait for these sessions only, not the `tee` log process substitution
+    if [ ${#pids[@]} -gt 0 ]; then
+        wait "${pids[@]}"
+    fi
 }
 
 # Batch output consumer that only logs errors
@@ -516,7 +525,8 @@ backup_mailboxes() {
 # Accounts phase of restore: accounts, passwords, aliases, forwarding and distribution
 # lists through zmprov batch sessions; signature and filter (multi-line values) per account
 restore_accounts() {
-    local i=0 email data cn sn given display shadow line missing
+    local i=0 email data cn sn given display shadow line missing accounts
+    accounts=$(account_list "$BACKUP_DIR/$DIR_MAILBOX")
     log "Preparing account commands"
     : > "$WORK_DIR/multiline"
     while IFS= read -r email <&3; do
@@ -548,14 +558,14 @@ restore_accounts() {
             echo "$email" >> "$WORK_DIR/multiline"
         fi
         i=$((i + 1))
-    done 3< "$BACKUP_DIR/$DIR_EMAILS"
+    done 3< "$accounts"
 
     log "Restoring $i account(s) with password, alias and forwarding address"
     zmprov_batch accounts batch_errors
 
     # Accounts the batch could not create are retried with the per-account path
     list_domain_accounts | sort > "$WORK_DIR/existing"
-    grep '@' "$BACKUP_DIR/$DIR_EMAILS" | sort | comm -23 - "$WORK_DIR/existing" > "$WORK_DIR/missing"
+    sort "$accounts" | comm -23 - "$WORK_DIR/existing" > "$WORK_DIR/missing"
     missing=$(count_accounts "$WORK_DIR/missing")
     if [ "$missing" -gt 0 ]; then
         log "WARNING: $missing account(s) not created by batch, retrying one by one"
@@ -674,7 +684,7 @@ restore() {
             log "Account backup not found in $BACKUP_DIR (emails.txt / userdata). Run backup with scope 1 (accounts) or 3 (all) first"
             exit 1
         fi
-        print_version_info "$BACKUP_DIR/backup_version.txt"
+        print_version_info "$BACKUP_DIR/backup_version.txt" "Accounts"
 
         log "Verifying domain $DOMAIN"
         if ! domain_exists; then
@@ -688,8 +698,9 @@ restore() {
                 exit 1
             fi
             log "Domain $DOMAIN created"
+        else
+            log "Domain $DOMAIN found"
         fi
-        log "Domain $DOMAIN found"
     fi
 
     if in_scope mailbox; then
@@ -698,7 +709,7 @@ restore() {
             echo "Please extract the mailbox backup files to $BASE_DIR/"
             exit 1
         fi
-        print_version_info "$BACKUP_DIR/$DIR_MAILBOX/backup_version.txt"
+        print_version_info "$BACKUP_DIR/$DIR_MAILBOX/backup_version.txt" "Mailbox"
         select_method restore
     fi
 
