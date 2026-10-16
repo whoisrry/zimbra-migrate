@@ -1,5 +1,32 @@
 # Changelog
 
+## [1.6.0] - 2026-10-17
+
+### fix
+- plain-text signatures (`zimbraPrefMailSignature`) were not backed up; only the HTML one was.
+- only the first signature of an account was backed up. Zimbra stores additional signatures as separate entries, so every signature is now read with `zmprov gsig` and recreated with `zmprov csig` (or `msig` when it already exists).
+- the default and reply/forward signature choice is restored and mapped to the new signature ids on the target.
+- outgoing filters (`zimbraMailOutgoingSieveScript`) are backed up and restored.
+- restore never checked that filters and signatures arrived. They are now read back from the target and compared with the backup (whitespace-insensitive); accounts that differ are restored again, up to two times, and remaining ones are listed in `failed_settings.txt`. The check also runs after mailbox import.
+
+### feat
+- restore scope `4) settings`: re-applies and verifies signatures and filters on existing accounts only (no account creation, no mailbox). Use it to repair accounts migrated with an earlier version.
+- backup cross-checks against LDAP that every account with a filter or signature has it in the backup, re-fetches missing ones one by one, logs `Filters backed up for N account(s) (LDAP: N), signatures for N account(s) (LDAP: N)` and lists failures in `failed_settings_backup.txt`.
+
+
+## [1.5.0] - 2026-10-17
+
+### feat
+- whole-server mode: pass `--all` instead of a domain (`backup --all`, `restore --all`, `backup-delta --all`, `restore-delta --all`) to process every domain of the server. Scope, method and compression are asked once for all domains.
+- whole-server backup writes `domains.txt` and `alias_domains.txt` to the backup root and produces one archive: `all-domains-accounts.tar.gz`, `all-domains-mailbox.tar`, `all-domains-backup.tar.gz` or `all-domains-backup-delta.tar.gz`.
+- alias domains are detected (`zimbraDomainType: alias`) and recreated on restore with their catch-all forwarding target instead of being backed up as empty domains.
+- whole-server restore creates every missing domain (one confirmation for all) before any account, then restores the accounts of all domains, then all distribution lists, so aliases and list members that point to another domain resolve.
+- `backup-delta --all`: pressing Enter uses each domain's own mailbox backup start time.
+
+### perf
+- `zmprov gadl` runs once per run instead of once per domain.
+
+
 ## [1.4.1] - 2026-10-08
 
 ### fix

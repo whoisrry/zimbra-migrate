@@ -41,6 +41,22 @@ Choose scope (1/2/3 or accounts/mailbox/all) [default: 3]:
 
 Scope `3` (all) runs both stages in one go, the same as versions before 1.4.0.
 
+### Whole server (`--all`)
+Replace the domain with `--all` in any step above, for example `JOBS=4 ./migrate.sh backup --all`.
+
+- **Backup** lists every domain with `zmprov -l gad` and checks each domain's type in one batch session. Local domains go to `domains.txt`. Alias domains go to `alias_domains.txt` with their catch-all target, for example `alias.com @contoh.com`. Each local domain is then backed up into its own `<domain>/` directory, exactly as a single-domain backup. The prompts are asked once.
+- **Archives** hold all domains plus both list files: `all-domains-accounts.tar.gz`, `all-domains-mailbox.tar`, `all-domains-backup.tar.gz`, `all-domains-backup-delta.tar.gz`. Extract them into `/opt/zimbra/backup/` on the target.
+- **Restore** reads `domains.txt` (or every `*.*` directory when it is missing) and runs in this order:
+  1. creates all missing domains and alias domains after one confirmation
+  2. restores accounts, passwords, aliases, forwarding, signatures and filters for every domain
+  3. creates distribution lists and members for every domain
+  4. imports mailboxes for every domain
+
+  Steps 1–3 run for all domains before the next step starts, so an alias or list member in another domain already exists when it is added.
+- **Delta**: `backup-delta --all` asks for the start time once. Pressing Enter uses each domain's own mailbox backup start time. `restore-delta --all` skips domains without a `mailbox/delta/` directory.
+
+Server-level configuration is not migrated: COS, global/server config, domain attributes other than alias domains, certificates and DKIM. Set it up on the target first.
+
 ### System accounts
 GAL sync (`galsync*`), spam/ham training and virus quarantine accounts are not migrated: backup excludes accounts with `zimbraIsSystemResource` or `zimbraIsSystemAccount` set, and restore skips `galsync*` entries found in older backups. Recreate the GAL sync account on the target:
 
@@ -96,17 +112,43 @@ With `JOBS=N`:
 
 Steps still run in order: accounts → signature/filter → distribution lists → members, and mailboxes only after accounts.
 
+## Signatures and Filters
+
+**What is migrated**
+- **Signatures**: every signature of an account, in HTML (`zimbraPrefMailSignatureHTML`) and plain text (`zimbraPrefMailSignature`). Zimbra keeps the first signature on the account entry and any others as separate entries, so the backup reads them with `zmprov gsig`.
+- **Signature choice**: the default and reply/forward signatures. Signature ids change on the target, so they are mapped by signature name.
+- **Filters**: incoming (`zimbraMailSieveScript`) and outgoing (`zimbraMailOutgoingSieveScript`).
+
+**Backup check**: after the account data is backed up, LDAP is searched for accounts that have a filter or signature. Any of those without one in the backup is fetched again on its own. The log shows both counts, which should match:
+
+```
+Filters backed up for 120 account(s) (LDAP: 120), signatures for 340 account(s) (LDAP: 340)
+```
+
+**Restore check**: after restoring, the filters and signatures of each account are read back from the target in one batch session and compared with the backup. Whitespace is ignored, and extra signatures on the target are allowed. Accounts that differ are restored again (`csig`, or `msig` when the signature exists) and checked again, up to two retries. Any account that still differs is listed in `failed_settings.txt`. The check runs after the accounts stage and again after mailbox import.
+
+**Repairing an earlier migration** (v1.5.0 and older did not back up plain-text or additional signatures):
+1. Source: `./migrate.sh backup <domain|--all>` → scope `1`.
+2. Copy the archive and extract it on the target.
+3. Target: `./migrate.sh restore <domain|--all>` → scope `4` (settings). Accounts and mailboxes are not touched. Only missing or different signatures and filters are written, then verified.
+
+Scope `4` also works with an older backup, but it can only restore what that backup contains: filters and the first HTML signature.
+
 ## Error Handling
 
 - **Batch backup**: an account without output files after the batch is backed up again with its own `zmprov -l ga`. A distribution list without a member file is retried with its own `zmprov gdlm`.
 - **Batch restore**: batch `ERROR` lines are logged as `zmprov: ...`. After the batch, the accounts on the target are compared with `emails.txt`. Missing accounts are created again one by one, with their aliases, forwarding, signature and filter.
 - **Mailbox export**: data is written to `<account>.tgz.part` and renamed only on success, so a failed export never leaves a file that looks valid.
 - **Failed mailbox transfers** are written to `failed_mailbox_backup.txt`, `failed_mailbox_restore.txt`, `failed_mailbox_delta.txt` or `failed_mailbox_delta_restore.txt` in the backup directory, and a summary is logged. The file is removed when nothing failed.
-- If the combined `zmprov ma` for signature/filter fails, each setting is retried separately.
+- Filters and signatures are restored with separate calls, so a rejected filter does not block the signatures. Accounts that still differ after two retries are listed in `failed_settings.txt`. Backup misses are listed in `failed_settings_backup.txt`.
 
 ## Backup Directory Layout
 
 ```
+/opt/zimbra/backup/
+├── domains.txt                 # --all only: local domains in the backup
+└── alias_domains.txt           # --all only: "<alias domain> @<target domain>"
+
 /opt/zimbra/backup/<domain>/
 ├── backup_version.txt          # accounts backup: version, start date, start epoch (seconds)
 ├── admin.txt                   # admin accounts (not restored automatically)
@@ -117,9 +159,14 @@ Steps still run in order: accounts → signature/filter → distribution lists �
 ├── userdata/<account>.txt      # cn, sn, givenName, displayName
 ├── alias/<account>.txt
 ├── forward/<account>.txt
-├── signature/<account>.name
+├── signature/<account>.name        # account-level signature (older backups use only these)
 ├── signature/<account>.signature
-├── filter/<account>.filter
+├── signature/<account>.text
+├── signature/<account>.sigcount    # number of signatures from zmprov gsig
+├── signature/<account>.sig<N>.name / .html / .text / .id
+├── signature/<account>.defaults    # default and reply/forward signature ids
+├── filter/<account>.filter         # incoming filter
+├── filter/<account>.outgoing       # outgoing filter
 ├── mailbox/backup_version.txt  # mailbox backup start time (default for backup-delta)
 ├── mailbox/<account>.tgz
 ├── mailbox/delta/<account>.tgz

@@ -1,11 +1,11 @@
 #!/bin/bash
 # ============================================================
 # Zimbra Migration Script
-# Version: 1.4.1
-# Last Modified: 2026-10-08
+# Version: 1.6.0
+# Last Modified: 2026-10-17
 # Note: curl cannot set start time
 # ============================================================
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.6.0"
 
 export ACTION=$1
 export DOMAIN=${2,,}
@@ -38,7 +38,9 @@ export DIR_ADMIN DIR_EMAILS DIR_DISTLIST DIR_DISTLIST_MEMBERS DIR_USERPASS DIR_U
     DIR_MAILBOX DIR_ALIAS DIR_FORWARD DIR_SIGNATURE DIR_FILTER DIR_DELTA
 
 # Account attributes fetched with `zmprov -l ga` during backup
-export ACCOUNT_ATTRS="userPassword cn sn givenName displayName zimbraMailAlias zimbraMailForwardingAddress zimbraSignatureName zimbraPrefMailSignatureHTML zimbraMailSieveScript"
+export ACCOUNT_ATTRS="userPassword cn sn givenName displayName zimbraMailAlias zimbraMailForwardingAddress zimbraSignatureName zimbraPrefMailSignatureHTML zimbraPrefMailSignature zimbraPrefDefaultSignatureId zimbraPrefForwardReplySignatureId zimbraMailSieveScript zimbraMailOutgoingSieveScript"
+# Attributes read back from the target to verify filters and signatures after restore
+export SETTINGS_ATTRS="zimbraSignatureName zimbraPrefMailSignatureHTML zimbraPrefMailSignature zimbraMailSieveScript zimbraMailOutgoingSieveScript"
 
 # ------------------------------------------------------------
 # Helpers
@@ -53,19 +55,22 @@ version() {
 }
 
 usage() {
-    echo "Usage: $0 <action> <domain>"
+    echo "Usage: $0 <action> <domain|--all>"
     echo "Actions:"
-    echo "  backup <domain>         (asks scope: 1) accounts  2) mailbox  3) all)"
-    echo "  restore <domain>        (asks scope: 1) accounts  2) mailbox  3) all)"
-    echo "  backup-delta <domain>"
-    echo "  restore-delta <domain>"
+    echo "  backup <domain|--all>         (asks scope: 1) accounts  2) mailbox  3) all)"
+    echo "  restore <domain|--all>        (asks scope: 1) accounts  2) mailbox  3) all)"
+    echo "  backup-delta <domain|--all>"
+    echo "  restore-delta <domain|--all>"
     echo "  version"
+    echo "  --all processes every domain of the server"
+    echo "  restore scope 4) settings re-applies and verifies signatures and filters only"
     echo "Environment:"
     echo "  JOBS=<n>        accounts processed in parallel (default: 1)"
     echo "  ZIMBRA_HOST, ZIMBRA_ADMIN_USER, ZIMBRA_ADMIN_PASSWORD (curl method)"
     echo "  BASE_DIR, LOG_FILE, TMP_PASSWORD"
     echo "Example: $0 backup contoh.com"
     echo "Example: JOBS=4 $0 restore contoh.com"
+    echo "Example: JOBS=4 $0 backup --all"
     exit 1
 }
 
@@ -107,20 +112,30 @@ prompt_admin_credentials() {
     fi
 }
 
-# Prompt for what to process ($1 = backup|restore); sets SCOPE to accounts|mailbox|all
+# Prompt for what to process ($1 = backup|restore); sets SCOPE to
+# accounts|mailbox|all, or settings (restore only)
 select_scope() {
+    local choices="1/2/3 or accounts/mailbox/all"
     echo "Select $1 scope:"
     echo "1) accounts  - accounts, passwords, aliases, forwarding, signatures, filters, distribution lists (no mailbox)"
     echo "2) mailbox   - mailbox content only"
     echo "3) all       - accounts and mailbox"
-    echo "Choose scope (1/2/3 or accounts/mailbox/all) [default: 3]:"
+    if [ "$1" == "restore" ]; then
+        echo "4) settings  - signatures and filters only: re-applied to existing accounts and verified"
+        choices="1/2/3/4 or accounts/mailbox/all/settings"
+    fi
+    echo "Choose scope ($choices) [default: 3]:"
     read -r SCOPE
     case "${SCOPE,,}" in
         1|accounts) SCOPE="accounts" ;;
         2|mailbox) SCOPE="mailbox" ;;
         ""|3|all) SCOPE="all" ;;
+        4|settings) [ "$1" == "restore" ] && SCOPE="settings" ;;
+    esac
+    case "$SCOPE" in
+        accounts|mailbox|all|settings) ;;
         *)
-            echo "Invalid scope. Please enter '1'/'accounts', '2'/'mailbox' or '3'/'all'"
+            echo "Invalid scope. Please enter $choices"
             exit 1
             ;;
     esac
@@ -185,6 +200,96 @@ list_domain_accounts() {
     zmprov -l sa "(&(objectClass=zimbraAccount)(mail=*@$DOMAIN)(!(zimbraIsSystemResource=TRUE))(!(zimbraIsSystemAccount=TRUE)))"
 }
 
+# Switch the current domain: BACKUP_DIR and a fresh per-domain WORK_DIR
+set_domain() {
+    DOMAIN=$1
+    BACKUP_DIR="$BASE_DIR/$DOMAIN"
+    WORK_DIR="$WORK_ROOT/$DOMAIN"
+    rm -rf "$WORK_DIR"
+    mkdir -p "$WORK_DIR"
+}
+
+# Find all domains of this server: local domains go to DOMAINS and $BASE_DIR/domains.txt,
+# alias domains (with their catch-all target) to $BASE_DIR/alias_domains.txt
+discover_domains() {
+    log "Get all domains"
+    zmprov -l gad | grep . > "$WORK_DIR/all_domains"
+    awk '{ print "gd " $0 " zimbraDomainType zimbraMailCatchAllForwardingAddress" }' \
+        "$WORK_DIR/all_domains" > "$WORK_DIR/gd.0"
+    zmprov_batch gd cat -l | awk '
+        { sub(/^(prov> )+/, "") }
+        /^# name / { d = $3 }
+        /^zimbraDomainType: alias/ { alias[d] = 1 }
+        /^zimbraMailCatchAllForwardingAddress: / { target[d] = $2 }
+        END { for (d in alias) print d, target[d] }' > "$BASE_DIR/alias_domains.txt"
+    awk 'FILENAME == ARGV[1] { alias[$1]; next } !($1 in alias)' \
+        "$BASE_DIR/alias_domains.txt" "$WORK_DIR/all_domains" > "$BASE_DIR/domains.txt"
+    mapfile -t DOMAINS < "$BASE_DIR/domains.txt"
+    log "Found ${#DOMAINS[@]} domain(s): ${DOMAINS[*]}"
+    if [ -s "$BASE_DIR/alias_domains.txt" ]; then
+        log "Alias domain(s), recreated on restore without accounts: $(awk '{ printf "%s ", $1 }' "$BASE_DIR/alias_domains.txt")"
+    fi
+}
+
+# Domains of a whole-server backup: domains.txt, or every subdirectory that looks
+# like a domain when domains.txt is missing
+load_backup_domains() {
+    if [ -s "$BASE_DIR/domains.txt" ]; then
+        mapfile -t DOMAINS < <(grep . "$BASE_DIR/domains.txt")
+    else
+        mapfile -t DOMAINS < <(find "$BASE_DIR" -mindepth 1 -maxdepth 1 -type d -name '*.*' -exec basename {} \; | sort)
+    fi
+    if [ ${#DOMAINS[@]} -eq 0 ]; then
+        log "No domain backups found in $BASE_DIR"
+        exit 1
+    fi
+    log "Domain(s) in backup: ${DOMAINS[*]}"
+}
+
+# Archive the backup of all DOMAINS for the selected scope into one file
+compress_backup() {
+    local d archive tar_opts="-czf" paths=() excludes=()
+    for d in "${DOMAINS[@]}"; do
+        case "$SCOPE" in
+            accounts)
+                paths+=("$d")
+                excludes+=("--exclude=$d/$DIR_MAILBOX")
+                ;;
+            mailbox)
+                paths+=("$d/$DIR_MAILBOX" "$d/$DIR_EMAILS")
+                excludes+=("--exclude=$d/$DIR_DELTA")
+                ;;
+            all)
+                paths+=("$d")
+                ;;
+        esac
+    done
+    case "$SCOPE" in
+        accounts) archive="$BASE_DIR/$ARCHIVE_PREFIX-accounts.tar.gz" ;;
+        mailbox)
+            # Mailbox archives are already gzip, so the outer tar is not compressed again
+            archive="$BASE_DIR/$ARCHIVE_PREFIX-mailbox.tar"
+            tar_opts="-cf"
+            ;;
+        all) archive="$BASE_DIR/$ARCHIVE_PREFIX-backup.tar.gz" ;;
+    esac
+    if [ -n "$ALL_DOMAINS" ]; then
+        paths+=(domains.txt alias_domains.txt)
+    fi
+    log "Compressing backup files"
+    tar -C "$BASE_DIR" "$tar_opts" "$archive" "${excludes[@]}" "${paths[@]}"
+    log "Backup files compressed to $archive"
+}
+
+# Version file whose start time is the default for backup-delta of domain $1
+delta_version_file() {
+    if [ -f "$BASE_DIR/$1/$DIR_MAILBOX/backup_version.txt" ]; then
+        echo "$BASE_DIR/$1/$DIR_MAILBOX/backup_version.txt"
+    else
+        echo "$BASE_DIR/$1/backup_version.txt"
+    fi
+}
+
 # Write script version, start date and start epoch (seconds) to $1
 write_version() {
     {
@@ -232,7 +337,7 @@ run_each() {
     local func=$1 list=$2 item
     shift 2
     if [ "$JOBS" -gt 1 ]; then
-        export -f "$func" log zcurl get_attr split_account_attrs
+        export -f "$func" log zcurl get_attr split_account_dump restore_signatures sig_id_names
         grep -v '^[[:space:]]*$' "$list" | tr '\n' '\0' |
             xargs -0 -P "$JOBS" -I{} "$BASH" -c '"$0" "$@"' "$func" {} "$@"
     else
@@ -276,50 +381,197 @@ batch_errors() {
 # Per-item workers
 # ------------------------------------------------------------
 
-# Split `zmprov ga` output (one or many accounts, each starting with "# name <account>")
-# into the per-account backup files
-split_account_attrs() {
-    awk -v d="$BACKUP_DIR" -v up="$DIR_USERPASS" -v ud="$DIR_USERDATA" -v al="$DIR_ALIAS" \
+# Split `zmprov ga` and `zmprov gsig` output into per-account backup files under $1.
+# $2 lists the accounts: a "# name <account>" header starts an account, any other
+# "# name <signature>" header (from gsig) starts the next signature of that account
+split_account_dump() {
+    awk -v d="$1" -v list="$2" -v up="$DIR_USERPASS" -v ud="$DIR_USERDATA" -v al="$DIR_ALIAS" \
         -v fw="$DIR_FORWARD" -v sg="$DIR_SIGNATURE" -v fl="$DIR_FILTER" '
-        function flush(   a) {
-            for (a in val) {
-                sub(/\n+$/, "", val[a])
-                print val[a] > file[a]
+        function aspec(k, dir, ext, mode) { adir[k] = dir; aext[k] = ext; amode[k] = mode }
+        function sspec(k, ext, mode) { sext[k] = ext; smode[k] = mode }
+        function emit(path, text) { print text > path; opened[path] = 1 }
+        function touch(path) { printf "" > path; opened[path] = 1 }
+        function flushval() {
+            if (cur != "") {
+                sub(/\n+$/, "", buf)
+                emit(curpath, buf)
             }
-            for (a in file) close(file[a])
-            split("", val)
             cur = ""
         }
-        function start(u,   a) {
-            flush()
-            userdata = d "/" ud "/" u ".txt"
-            file["userPassword"] = d "/" up "/" u ".shadow"
-            file["cn"] = file["sn"] = file["givenName"] = file["displayName"] = userdata
-            file["zimbraMailAlias"] = d "/" al "/" u ".txt"
-            file["zimbraMailForwardingAddress"] = d "/" fw "/" u ".txt"
-            file["zimbraSignatureName"] = d "/" sg "/" u ".name"
-            file["zimbraPrefMailSignatureHTML"] = d "/" sg "/" u ".signature"
-            file["zimbraMailSieveScript"] = d "/" fl "/" u ".filter"
-            # Always create every file, even when the attribute is not set
-            for (a in file) printf "" > file[a]
+        function finish(   path) {
+            flushval()
+            if (u != "") emit(d "/" sg "/" u ".sigcount", n)
+            for (path in opened) close(path)
+            split("", opened)
+            u = ""
         }
-        BEGIN { multi["zimbraPrefMailSignatureHTML"] = multi["zimbraMailSieveScript"] = 1 }
+        function start(name,   k) {
+            finish()
+            u = name
+            n = 0
+            # Every account-level file exists, even when the attribute is not set
+            for (k in adir) touch(d "/" adir[k] "/" u aext[k])
+        }
+        BEGIN {
+            while ((getline line < list) > 0) acct[tolower(line)] = 1
+            # mode: v = value only, l = whole "attr: value" line, m = multi-line value
+            aspec("userPassword", up, ".shadow", "v")
+            aspec("cn", ud, ".txt", "l"); aspec("sn", ud, ".txt", "l")
+            aspec("givenName", ud, ".txt", "l"); aspec("displayName", ud, ".txt", "l")
+            aspec("zimbraMailAlias", al, ".txt", "v")
+            aspec("zimbraMailForwardingAddress", fw, ".txt", "v")
+            aspec("zimbraSignatureName", sg, ".name", "v")
+            aspec("zimbraPrefMailSignatureHTML", sg, ".signature", "m")
+            aspec("zimbraPrefMailSignature", sg, ".text", "m")
+            aspec("zimbraPrefDefaultSignatureId", sg, ".defaults", "l")
+            aspec("zimbraPrefForwardReplySignatureId", sg, ".defaults", "l")
+            aspec("zimbraMailSieveScript", fl, ".filter", "m")
+            aspec("zimbraMailOutgoingSieveScript", fl, ".outgoing", "m")
+            sspec("zimbraSignatureName", "name", "v")
+            sspec("zimbraSignatureId", "id", "v")
+            sspec("zimbraPrefMailSignatureHTML", "html", "m")
+            sspec("zimbraPrefMailSignature", "text", "m")
+        }
         { sub(/^(prov> )+/, "") }
-        /^# name / { start($3); next }
-        /^ERROR: / { cur = ""; next }
-        match($0, /^[A-Za-z]+: /) && (substr($0, 1, RLENGTH - 2) in file) {
-            cur = substr($0, 1, RLENGTH - 2)
-            value = substr($0, RLENGTH + 1)
-            if (cur in multi) {
-                val[cur] = value
-            } else {
-                print (file[cur] == userdata ? $0 : value) > file[cur]
+        /^# name / {
+            name = substr($0, 8)
+            if (tolower(name) in acct) {
+                start(name)
+            } else if (u != "") {
+                flushval()
+                n++
             }
             next
         }
-        # Continuation lines of multi-line values (HTML signature, sieve script)
-        cur in multi { val[cur] = val[cur] "\n" $0 }
-        END { flush() }'
+        /^ERROR: / { flushval(); next }
+        # Attribute line. Unknown zimbra* attributes end the previous multi-line value
+        # and are ignored
+        /^(userPassword|cn|sn|givenName|displayName|zimbra[A-Za-z]*): / {
+            if (u == "") next
+            flushval()
+            k = substr($0, 1, index($0, ":") - 1)
+            value = substr($0, length(k) + 3)
+            if (n == 0 && (k in amode)) {
+                mode = amode[k]
+                path = d "/" adir[k] "/" u aext[k]
+            } else if (n > 0 && (k in smode)) {
+                mode = smode[k]
+                path = d "/" sg "/" u ".sig" n "." sext[k]
+            } else {
+                next
+            }
+            if (mode == "m") {
+                cur = k
+                curpath = path
+                buf = value
+            } else {
+                emit(path, mode == "l" ? $0 : value)
+            }
+            next
+        }
+        # Continuation lines of multi-line values (signatures, sieve scripts)
+        cur != "" { buf = buf "\n" $0 }
+        END { finish() }'
+}
+
+# Batch output consumers for split_account_dump
+split_backup_dump() {
+    split_account_dump "$BACKUP_DIR" "$BACKUP_DIR/$DIR_EMAILS"
+}
+
+split_target_dump() {
+    split_account_dump "$WORK_DIR/target" "$WORK_DIR/check_list"
+}
+
+# Print "<id><TAB><name>" for each signature in `zmprov gsig` output
+sig_id_names() {
+    awk '{ sub(/^(prov> )+/, "") }
+        /^# name / { if (id != "") print id "\t" name; id = ""; name = "" }
+        /^zimbraSignatureId: / { id = $2 }
+        /^zimbraSignatureName: / { name = substr($0, 22) }
+        END { if (id != "") print id "\t" name }'
+}
+
+# True when backup tree $1 holds at least one signature for account $2
+has_signature_backup() {
+    local count
+    count=$(cat "$1/$DIR_SIGNATURE/$2.sigcount" 2>/dev/null)
+    [ "${count:-0}" -gt 0 ] || [ -s "$1/$DIR_SIGNATURE/$2.signature" ] || [ -s "$1/$DIR_SIGNATURE/$2.text" ]
+}
+
+# One line per filter and signature of account $2 in backup tree $1, with whitespace-
+# insensitive checksums: "filter <sum>", "outgoing <sum>", "sig <name> <html> <text>".
+# Backups without per-signature files fall back to the account-level signature
+settings_lines() {
+    local dir=$1 email=$2 f base
+    for f in filter outgoing; do
+        if [ -s "$dir/$DIR_FILTER/$email.$f" ]; then
+            echo "$f $(tr -d '[:space:]' < "$dir/$DIR_FILTER/$email.$f" | cksum)"
+        fi
+    done
+    if compgen -G "$dir/$DIR_SIGNATURE/$email.sig*.name" > /dev/null; then
+        for f in "$dir/$DIR_SIGNATURE/$email".sig*.name; do
+            base=${f%.name}
+            sig_line "$(cat "$f")" "$base.html" "$base.text"
+        done
+    elif has_signature_backup "$dir" "$email"; then
+        sig_line "$(cat "$dir/$DIR_SIGNATURE/$email.name" 2>/dev/null)" \
+            "$dir/$DIR_SIGNATURE/$email.signature" "$dir/$DIR_SIGNATURE/$email.text"
+    fi
+}
+
+sig_line() {
+    echo "sig ${1:-Signature} $(tr -d '[:space:]' 2>/dev/null < "$2" | cksum) $(tr -d '[:space:]' 2>/dev/null < "$3" | cksum)"
+}
+
+# True when every filter and signature of account $1 in the backup is on the target
+# ($WORK_DIR/target); extra signatures on the target are ignored
+settings_match() {
+    settings_lines "$WORK_DIR/target" "$1" > "$WORK_DIR/target_lines"
+    ! settings_lines "$BACKUP_DIR" "$1" | grep -vxF -f "$WORK_DIR/target_lines" | grep -q .
+}
+
+# Read the current filters and signatures of the accounts in $1 into $WORK_DIR/target
+collect_target_settings() {
+    rm -rf "$WORK_DIR/target" "$WORK_DIR"/check.[0-9]*
+    mkdir -p "$WORK_DIR/target"/{"$DIR_USERPASS","$DIR_USERDATA","$DIR_ALIAS","$DIR_FORWARD","$DIR_SIGNATURE","$DIR_FILTER"}
+    cp "$1" "$WORK_DIR/check_list"
+    awk -v n="$JOBS" -v p="$WORK_DIR/check" -v attrs="$SETTINGS_ATTRS" \
+        '/@/ { c = p "." (NR % n); print "ga " $0 " " attrs > c; print "gsig " $0 > c }' "$1"
+    zmprov_batch check split_target_dump -l
+}
+
+# Make filters and signatures on this server match the backup for the accounts in $1:
+# compare, restore the accounts that differ, compare again, report what still differs
+sync_settings() {
+    local list=$1 email pass wanted="$WORK_DIR/settings_wanted" todo="$WORK_DIR/settings_todo"
+    while IFS= read -r email; do
+        [ -n "$(settings_lines "$BACKUP_DIR" "$email")" ] && echo "$email"
+    done < <(grep '@' "$list") > "$wanted"
+    if [ ! -s "$wanted" ]; then
+        log "No signatures or filters in the backup of $DOMAIN"
+        return
+    fi
+    cp "$wanted" "$todo"
+    for pass in 1 2 3; do
+        collect_target_settings "$todo"
+        while IFS= read -r email; do
+            settings_match "$email" || echo "$email"
+        done < "$todo" > "$todo.next"
+        mv "$todo.next" "$todo"
+        if [ ! -s "$todo" ]; then
+            log "Signatures and filters verified for $(count_accounts "$wanted") account(s)"
+            rm -f "$BACKUP_DIR/failed_settings.txt"
+            return
+        fi
+        if [ $pass -eq 3 ]; then
+            break
+        fi
+        log "Restoring signatures and filters for $(count_accounts "$todo") account(s)"
+        run_each restore_account_settings "$todo" multiline
+    done
+    cp "$todo" "$BACKUP_DIR/failed_settings.txt"
+    log "WARNING: Signatures/filters still differ from the backup for $(count_accounts "$todo") account(s), listed in $BACKUP_DIR/failed_settings.txt"
 }
 
 # Split `zmprov gdlm` output (one or many lists) into per-list member files
@@ -333,10 +585,10 @@ split_dl_members() {
         out != "" { print > out }'
 }
 
-# Fallback: back up one account with its own `zmprov` call
+# Fallback: back up one account (attributes and signatures) without a batch session
 backup_account() {
     # shellcheck disable=SC2086
-    zmprov -l ga "$1" $ACCOUNT_ATTRS | split_account_attrs
+    { zmprov -l ga "$1" $ACCOUNT_ATTRS; zmprov -l gsig "$1"; } | split_account_dump "$BACKUP_DIR" "$BACKUP_DIR/$DIR_EMAILS"
     log "Account data downloaded for .... $1"
 }
 
@@ -407,11 +659,11 @@ restore_account() {
     log "User account restored for .... $email"
 }
 
-# Restore aliases, signature, filter and forwarding addresses of one account.
-# With $2 = "multiline" only the signature and filter are restored (the rest is
-# done by the batch session)
+# Restore aliases, forwarding addresses, filters and signatures of one account.
+# With $2 = "multiline" only filters and signatures are restored (aliases and
+# forwarding are done by the batch session)
 restore_account_settings() {
-    local email=$1 only_multiline=$2 alias fwd signame sightml filter sigid settings=() forwards=()
+    local email=$1 only_multiline=$2 alias fwd filter outgoing args=()
     if [ -z "$only_multiline" ]; then
         if [ -f "$BACKUP_DIR/$DIR_ALIAS/$email.txt" ]; then
             for alias in $(grep '@' "$BACKUP_DIR/$DIR_ALIAS/$email.txt"); do
@@ -420,45 +672,100 @@ restore_account_settings() {
             done
         fi
         if [ -f "$BACKUP_DIR/$DIR_FORWARD/$email.txt" ]; then
-            mapfile -t forwards < <(grep '@' "$BACKUP_DIR/$DIR_FORWARD/$email.txt")
+            for fwd in $(grep '@' "$BACKUP_DIR/$DIR_FORWARD/$email.txt"); do
+                zmprov ma "$email" +zimbraMailForwardingAddress "$fwd"
+            done
         fi
     fi
 
-    signame=$(cat "$BACKUP_DIR/$DIR_SIGNATURE/$email.name" 2>/dev/null)
-    sightml=$(cat "$BACKUP_DIR/$DIR_SIGNATURE/$email.signature" 2>/dev/null)
     filter=$(cat "$BACKUP_DIR/$DIR_FILTER/$email.filter" 2>/dev/null)
-
-    # One `zmprov ma` for everything; fall back to separate calls so one bad value
-    # does not block the others
-    if [ -n "$signame$sightml" ]; then
-        settings+=(zimbraSignatureName "$signame" zimbraPrefMailSignatureHTML "$sightml")
-    fi
+    outgoing=$(cat "$BACKUP_DIR/$DIR_FILTER/$email.outgoing" 2>/dev/null)
     if [ -n "$filter" ]; then
-        settings+=(zimbraMailSieveScript "$filter")
+        args+=(zimbraMailSieveScript "$filter")
     fi
-    for fwd in "${forwards[@]}"; do
-        settings+=(+zimbraMailForwardingAddress "$fwd")
-    done
-    if [ ${#settings[@]} -gt 0 ] && ! zmprov ma "$email" "${settings[@]}"; then
-        log "WARNING: Combined settings update failed for $email, retrying one by one"
-        if [ -n "$signame$sightml" ]; then
-            zmprov ma "$email" zimbraSignatureName "$signame" zimbraPrefMailSignatureHTML "$sightml"
-        fi
-        if [ -n "$filter" ]; then
-            zmprov ma "$email" zimbraMailSieveScript "$filter"
-        fi
-        for fwd in "${forwards[@]}"; do
-            zmprov ma "$email" +zimbraMailForwardingAddress "$fwd"
-        done
+    if [ -n "$outgoing" ]; then
+        args+=(zimbraMailOutgoingSieveScript "$outgoing")
+    fi
+    if [ ${#args[@]} -gt 0 ] && ! zmprov ma "$email" "${args[@]}"; then
+        log "ERROR: Filter restore failed for .... $email"
     fi
 
-    if [ -n "$signame$sightml" ]; then
-        sigid=$(zmprov ga "$email" zimbraSignatureId | sed -n 's/^zimbraSignatureId: //p')
-        if [ -n "$sigid" ]; then
-            zmprov ma "$email" zimbraPrefDefaultSignatureId "$sigid" zimbraPrefForwardReplySignatureId "$sigid"
+    restore_signatures "$email"
+    log "Settings restored for .... $email (filter: $([ -n "$filter$outgoing" ] && echo yes || echo no))"
+}
+
+# Recreate the signatures of one account and its default/reply signature choice.
+# Backups from v1.6.0 hold every signature (zmprov gsig); older ones only the
+# account-level signature
+restore_signatures() {
+    local email=$1 sigdir="$BACKUP_DIR/$DIR_SIGNATURE" f base name html text id attr old_id new_id sid sname args
+    local -A old_names new_ids
+    if compgen -G "$sigdir/$email.sig*.name" > /dev/null; then
+        for f in "$sigdir/$email".sig*.name; do
+            base=${f%.name}
+            name=$(cat "$f")
+            [ -n "$name" ] || continue
+            html=$(cat "$base.html" 2>/dev/null)
+            text=$(cat "$base.text" 2>/dev/null)
+            id=$(cat "$base.id" 2>/dev/null)
+            if [ -n "$id" ]; then
+                old_names[$id]=$name
+            fi
+            args=()
+            if [ -n "$html" ]; then
+                args+=(zimbraPrefMailSignatureHTML "$html")
+            fi
+            if [ -n "$text" ]; then
+                args+=(zimbraPrefMailSignature "$text")
+            fi
+            # Update the signature when it already exists (re-run, or restored by an
+            # older version); an empty value clears the other format
+            if ! zmprov csig "$email" "$name" "${args[@]}" > /dev/null 2>&1; then
+                zmprov msig "$email" "$name" zimbraPrefMailSignatureHTML "$html" zimbraPrefMailSignature "$text" ||
+                    log "ERROR: Signature '$name' restore failed for .... $email"
+            fi
+        done
+
+        # Signature ids change on the target: map old id -> name -> new id
+        if [ -s "$sigdir/$email.defaults" ]; then
+            while IFS=$'\t' read -r sid sname; do
+                [ -n "$sname" ] && new_ids[$sname]=$sid
+            done < <(zmprov -l gsig "$email" | sig_id_names)
+            args=()
+            for attr in zimbraPrefDefaultSignatureId zimbraPrefForwardReplySignatureId; do
+                old_id=$(get_attr "$attr" "$sigdir/$email.defaults")
+                [ -n "$old_id" ] && [ -n "${old_names[$old_id]+set}" ] || continue
+                new_id=${new_ids[${old_names[$old_id]}]}
+                if [ -n "$new_id" ]; then
+                    args+=("$attr" "$new_id")
+                fi
+            done
+            if [ ${#args[@]} -gt 0 ]; then
+                zmprov ma "$email" "${args[@]}"
+            fi
         fi
+        return
     fi
-    log "Settings restored for .... $email (signature: $([ -n "$signame$sightml" ] && echo yes || echo no), filter: $([ -n "$filter" ] && echo yes || echo no))"
+
+    # Older backup: the account-level signature only
+    name=$(cat "$sigdir/$email.name" 2>/dev/null)
+    html=$(cat "$sigdir/$email.signature" 2>/dev/null)
+    text=$(cat "$sigdir/$email.text" 2>/dev/null)
+    if [ -z "$html$text" ]; then
+        return
+    fi
+    args=(zimbraSignatureName "${name:-Signature}")
+    if [ -n "$html" ]; then
+        args+=(zimbraPrefMailSignatureHTML "$html")
+    fi
+    if [ -n "$text" ]; then
+        args+=(zimbraPrefMailSignature "$text")
+    fi
+    zmprov ma "$email" "${args[@]}"
+    id=$(zmprov ga "$email" zimbraSignatureId | sed -n 's/^zimbraSignatureId: //p')
+    if [ -n "$id" ]; then
+        zmprov ma "$email" zimbraPrefDefaultSignatureId "$id" zimbraPrefForwardReplySignatureId "$id"
+    fi
 }
 
 # ------------------------------------------------------------
@@ -478,7 +785,11 @@ backup_accounts() {
     zmprov -l sa "(&(objectClass=zimbraAccount)(zimbraIsAdminAccount=TRUE)(|(mail=*@$DOMAIN)(zimbraMailAlias=*@$DOMAIN)))" > "$BACKUP_DIR/$DIR_ADMIN"
 
     log "Get all distribution list"
-    zmprov gadl | awk -F@ -v d="$DOMAIN" 'tolower($2) == d' > "$BACKUP_DIR/$DIR_DISTLIST"
+    # All lists of the server are fetched once per run and filtered per domain
+    if [ ! -f "$WORK_ROOT/all_dls" ]; then
+        zmprov gadl > "$WORK_ROOT/all_dls"
+    fi
+    awk -F@ -v d="$DOMAIN" 'tolower($2) == d' "$WORK_ROOT/all_dls" > "$BACKUP_DIR/$DIR_DISTLIST"
     if [ -s "$BACKUP_DIR/$DIR_DISTLIST" ]; then
         mkdir -p "$BACKUP_DIR/$DIR_DISTLIST_MEMBERS"
         awk '{ print "gdlm " $0 }' "$BACKUP_DIR/$DIR_DISTLIST" > "$WORK_DIR/gdlm.0"
@@ -495,12 +806,14 @@ backup_accounts() {
 
     total=$(count_accounts "$BACKUP_DIR/$DIR_EMAILS")
     log "Get all account data (password, user data, alias, forwarding, signature, filter) for $total account(s)"
+    # ga and gsig of one account stay in the same session, in that order
     awk -v n="$JOBS" -v p="$WORK_DIR/ga" -v attrs="$ACCOUNT_ATTRS" \
-        '/@/ { print "ga " $0 " " attrs > (p "." (NR % n)) }' "$BACKUP_DIR/$DIR_EMAILS"
-    zmprov_batch ga split_account_attrs -l
+        '/@/ { c = p "." (NR % n); print "ga " $0 " " attrs > c; print "gsig " $0 > c }' "$BACKUP_DIR/$DIR_EMAILS"
+    zmprov_batch ga split_backup_dump -l
 
     while IFS= read -r email; do
-        [ -f "$BACKUP_DIR/$DIR_USERDATA/$email.txt" ] || echo "$email"
+        [ -f "$BACKUP_DIR/$DIR_USERDATA/$email.txt" ] && [ -f "$BACKUP_DIR/$DIR_SIGNATURE/$email.sigcount" ] ||
+            echo "$email"
     done < <(grep '@' "$BACKUP_DIR/$DIR_EMAILS") > "$WORK_DIR/ga_missing"
     missing=$(count_accounts "$WORK_DIR/ga_missing")
     if [ "$missing" -gt 0 ]; then
@@ -508,6 +821,46 @@ backup_accounts() {
         run_each backup_account "$WORK_DIR/ga_missing"
     fi
     log "Account data downloaded for $(find "$BACKUP_DIR/$DIR_USERDATA" -name '*.txt' | wc -l | tr -d ' ') of $total account(s)"
+    check_backup_settings
+}
+
+# Cross-check against LDAP that every account with a filter or signature has it in the
+# backup; accounts that do not are fetched again one by one
+check_backup_settings() {
+    local base="(&(objectClass=zimbraAccount)(mail=*@$DOMAIN)(!(zimbraIsSystemResource=TRUE))(!(zimbraIsSystemAccount=TRUE))"
+    local email pass filters signatures
+    zmprov -l sa "$base(|(zimbraMailSieveScript=*)(zimbraMailOutgoingSieveScript=*)))" > "$WORK_DIR/has_filter"
+    zmprov -l sa "$base(|(zimbraPrefMailSignatureHTML=*)(zimbraPrefMailSignature=*)))" > "$WORK_DIR/has_signature"
+    for pass in 1 2; do
+        {
+            while IFS= read -r email; do
+                [ -s "$BACKUP_DIR/$DIR_FILTER/$email.filter" ] || [ -s "$BACKUP_DIR/$DIR_FILTER/$email.outgoing" ] ||
+                    echo "$email"
+            done < "$WORK_DIR/has_filter"
+            while IFS= read -r email; do
+                has_signature_backup "$BACKUP_DIR" "$email" || echo "$email"
+            done < "$WORK_DIR/has_signature"
+        } | sort -u > "$WORK_DIR/settings_missing"
+        if [ ! -s "$WORK_DIR/settings_missing" ] || [ $pass -eq 2 ]; then
+            break
+        fi
+        log "WARNING: Filters/signatures missing from the backup for $(count_accounts "$WORK_DIR/settings_missing") account(s), fetching them one by one"
+        run_each backup_account "$WORK_DIR/settings_missing"
+    done
+    if [ -s "$WORK_DIR/settings_missing" ]; then
+        cp "$WORK_DIR/settings_missing" "$BACKUP_DIR/failed_settings_backup.txt"
+        log "ERROR: Filters/signatures could not be backed up for $(count_accounts "$WORK_DIR/settings_missing") account(s), listed in $BACKUP_DIR/failed_settings_backup.txt"
+    else
+        rm -f "$BACKUP_DIR/failed_settings_backup.txt"
+    fi
+    filters=$(find "$BACKUP_DIR/$DIR_FILTER" -type f -size +0 | sed 's#.*/##; s/\.[a-z]*$//' | sort -u | grep -c '@')
+    signatures=0
+    while IFS= read -r email; do
+        if has_signature_backup "$BACKUP_DIR" "$email"; then
+            signatures=$((signatures + 1))
+        fi
+    done < <(grep '@' "$BACKUP_DIR/$DIR_EMAILS")
+    log "Filters backed up for $filters account(s) (LDAP: $(count_accounts "$WORK_DIR/has_filter")), signatures for $signatures account(s) (LDAP: $(count_accounts "$WORK_DIR/has_signature"))"
 }
 
 # Mailbox phase of backup
@@ -522,13 +875,12 @@ backup_mailboxes() {
     log "Backup Mailbox Completed"
 }
 
-# Accounts phase of restore: accounts, passwords, aliases, forwarding and distribution
-# lists through zmprov batch sessions; signature and filter (multi-line values) per account
+# Accounts phase of restore: accounts, passwords, aliases and forwarding through zmprov
+# batch sessions; signature and filter (multi-line values) per account
 restore_accounts() {
     local i=0 email data cn sn given display shadow line missing accounts
     accounts=$(account_list "$BACKUP_DIR/$DIR_MAILBOX")
     log "Preparing account commands"
-    : > "$WORK_DIR/multiline"
     while IFS= read -r email <&3; do
         [[ "$email" == *@* ]] || continue
         data="$BACKUP_DIR/$DIR_USERDATA/$email.txt"
@@ -553,10 +905,6 @@ restore_accounts() {
             awk -v e="$email" '/@/ { print "aaa", e, $1 }' "$BACKUP_DIR/$DIR_ALIAS/$email.txt" 2>/dev/null
             awk -v e="$email" '/@/ { print "ma", e, "+zimbraMailForwardingAddress", $1 }' "$BACKUP_DIR/$DIR_FORWARD/$email.txt" 2>/dev/null
         } >> "$WORK_DIR/accounts.$((i % JOBS))"
-        if [ -s "$BACKUP_DIR/$DIR_SIGNATURE/$email.name" ] || [ -s "$BACKUP_DIR/$DIR_SIGNATURE/$email.signature" ] \
-            || [ -s "$BACKUP_DIR/$DIR_FILTER/$email.filter" ]; then
-            echo "$email" >> "$WORK_DIR/multiline"
-        fi
         i=$((i + 1))
     done 3< "$accounts"
 
@@ -574,15 +922,15 @@ restore_accounts() {
     fi
     log "Restore User Account Completed"
 
-    grep -vxF -f "$WORK_DIR/missing" "$WORK_DIR/multiline" > "$WORK_DIR/multiline_todo"
-    if [ -s "$WORK_DIR/multiline_todo" ]; then
-        log "Restoring signature and filter for $(count_accounts "$WORK_DIR/multiline_todo") account(s)"
-        run_each restore_account_settings "$WORK_DIR/multiline_todo" multiline
-        log "Restore Signature and Filter Completed"
-    fi
+    log "Restoring signatures and filters"
+    sync_settings "$accounts"
+}
 
+# Distribution lists and members of the current domain, run after the accounts of
+# every domain exist
+restore_dls() {
     if [ -s "$BACKUP_DIR/$DIR_DISTLIST" ]; then
-        log "Restoring distribution list"
+        log "Restoring distribution list for $DOMAIN"
         # Lists are created before members are added so nested lists resolve
         {
             awk '{ print "cdl " $0 }' "$BACKUP_DIR/$DIR_DISTLIST"
@@ -606,6 +954,31 @@ restore_mailboxes() {
     run_each import_mailbox "$accounts" "$BACKUP_DIR/$DIR_MAILBOX"
     report_failures "Mailbox restore"
     log "Restore Mailbox Completed"
+
+    # The import must not leave filters or signatures behind; re-check when the
+    # account backup is present
+    if [ -d "$BACKUP_DIR/$DIR_SIGNATURE" ]; then
+        log "Re-checking signatures and filters after mailbox import"
+        sync_settings "$accounts"
+    fi
+}
+
+# Restore scope "settings": re-apply and verify signatures and filters of existing accounts
+restore_settings() {
+    local d
+    for d in "${DOMAINS[@]}"; do
+        if [ ! -f "$BASE_DIR/$d/$DIR_EMAILS" ] || [ ! -d "$BASE_DIR/$d/$DIR_SIGNATURE" ]; then
+            log "Account backup not found in $BASE_DIR/$d (emails.txt / signature). Run backup with scope 1 (accounts) or 3 (all) first"
+            exit 1
+        fi
+    done
+    log "Restoring signatures and filters for $TARGET_LABEL (jobs: $JOBS)"
+    for d in "${DOMAINS[@]}"; do
+        set_domain "$d"
+        log "==== Domain $DOMAIN: signatures and filters"
+        sync_settings "$(account_list "$BACKUP_DIR/$DIR_MAILBOX")"
+    done
+    log "Restore $TARGET_LABEL (settings) completed in $(elapsed)"
 }
 
 # ------------------------------------------------------------
@@ -613,14 +986,24 @@ restore_mailboxes() {
 # ------------------------------------------------------------
 
 backup() {
-    local archive
-    log "[v$SCRIPT_VERSION] Starting backup for $DOMAIN"
-    log "Verifying domain $DOMAIN"
-    if ! domain_exists; then
-        log "Domain $DOMAIN not found"
-        exit 1
+    local d
+    log "[v$SCRIPT_VERSION] Starting backup for $TARGET_LABEL"
+    mkdir -p "$BASE_DIR"
+    if [ -n "$ALL_DOMAINS" ]; then
+        discover_domains
+        if [ ${#DOMAINS[@]} -eq 0 ]; then
+            log "No domains found on this server"
+            exit 1
+        fi
+    else
+        log "Verifying domain $DOMAIN"
+        if ! domain_exists; then
+            log "Domain $DOMAIN not found"
+            exit 1
+        fi
+        log "Domain $DOMAIN found"
+        DOMAINS=("$DOMAIN")
     fi
-    log "Domain $DOMAIN found"
     select_scope backup
     if in_scope mailbox; then
         select_method backup
@@ -631,175 +1014,253 @@ backup() {
         COMPRESS="n"
     fi
     echo ""
-    log "Backup $DOMAIN (scope: $SCOPE, jobs: $JOBS)"
-    mkdir -p "$BACKUP_DIR"
+    log "Backup $TARGET_LABEL (scope: $SCOPE, jobs: $JOBS)"
 
-    log "Get all emails account"
-    list_domain_accounts > "$BACKUP_DIR/$DIR_EMAILS"
-    log "Found $(count_accounts "$BACKUP_DIR/$DIR_EMAILS") account(s)"
-
-    if in_scope accounts; then
-        backup_accounts
-    fi
-    if in_scope mailbox; then
-        backup_mailboxes
-    fi
+    for d in "${DOMAINS[@]}"; do
+        set_domain "$d"
+        log "==== Domain $DOMAIN"
+        mkdir -p "$BACKUP_DIR"
+        log "Get all emails account"
+        list_domain_accounts > "$BACKUP_DIR/$DIR_EMAILS"
+        log "Found $(count_accounts "$BACKUP_DIR/$DIR_EMAILS") account(s)"
+        if in_scope accounts; then
+            backup_accounts
+        fi
+        if in_scope mailbox; then
+            backup_mailboxes
+        fi
+    done
 
     if [ "$COMPRESS" == "y" ]; then
-        log "Compressing backup files"
-        case "$SCOPE" in
-            accounts)
-                archive="$BASE_DIR/$DOMAIN-accounts.tar.gz"
-                tar -C "$BASE_DIR" -czf "$archive" --exclude="$DOMAIN/$DIR_MAILBOX" "$DOMAIN"
-                ;;
-            mailbox)
-                # Mailbox archives are already gzip, so the outer tar is not compressed again
-                archive="$BASE_DIR/$DOMAIN-mailbox.tar"
-                tar -C "$BASE_DIR" -cf "$archive" --exclude="$DOMAIN/$DIR_DELTA" "$DOMAIN/$DIR_MAILBOX" "$DOMAIN/$DIR_EMAILS"
-                ;;
-            all)
-                archive="$BASE_DIR/$DOMAIN-backup.tar.gz"
-                tar -C "$BASE_DIR" -czf "$archive" "$DOMAIN"
-                ;;
-        esac
-        log "Backup files compressed to $archive"
+        compress_backup
     fi
-    log "Backup $DOMAIN ($SCOPE) completed in $(elapsed)"
+    log "Backup $TARGET_LABEL ($SCOPE) completed in $(elapsed)"
     if [ "$SCOPE" == "accounts" ]; then
         echo "Next: restore the accounts on the target, then run backup again with scope 2 (mailbox)"
     fi
 }
 
 restore() {
-    log "[v$SCRIPT_VERSION] Starting restore for $DOMAIN"
-    if [ ! -d "$BACKUP_DIR" ]; then
-        log "Backup directory $BACKUP_DIR not found"
-        echo "Please extract the backup files to $BASE_DIR/"
-        exit 1
-    fi
-    select_scope restore
-
-    if in_scope accounts; then
-        if [ ! -s "$BACKUP_DIR/$DIR_EMAILS" ] || [ ! -d "$BACKUP_DIR/$DIR_USERDATA" ]; then
-            log "Account backup not found in $BACKUP_DIR (emails.txt / userdata). Run backup with scope 1 (accounts) or 3 (all) first"
+    local d missing_domains=() alias target
+    log "[v$SCRIPT_VERSION] Starting restore for $TARGET_LABEL"
+    if [ -n "$ALL_DOMAINS" ]; then
+        load_backup_domains
+    else
+        if [ ! -d "$BACKUP_DIR" ]; then
+            log "Backup directory $BACKUP_DIR not found"
+            echo "Please extract the backup files to $BASE_DIR/"
             exit 1
         fi
-        print_version_info "$BACKUP_DIR/backup_version.txt" "Accounts"
+        DOMAINS=("$DOMAIN")
+    fi
+    select_scope restore
+    if [ "$SCOPE" == "settings" ]; then
+        restore_settings
+        return
+    fi
 
-        log "Verifying domain $DOMAIN"
-        if ! domain_exists; then
-            log "Domain $DOMAIN not found"
-            if ! ask_yn "Do you want to create domain $DOMAIN?"; then
-                log "Domain $DOMAIN not found and not created"
+    if in_scope accounts; then
+        for d in "${DOMAINS[@]}"; do
+            if [ ! -f "$BASE_DIR/$d/$DIR_EMAILS" ] || [ ! -d "$BASE_DIR/$d/$DIR_USERDATA" ]; then
+                log "Account backup not found in $BASE_DIR/$d (emails.txt / userdata). Run backup with scope 1 (accounts) or 3 (all) first"
                 exit 1
             fi
-            if ! zmprov cd "$DOMAIN"; then
-                log "Failed to create domain $DOMAIN"
+            print_version_info "$BASE_DIR/$d/backup_version.txt" "$d accounts"
+        done
+
+        # Every domain (and alias domain) is created before any account, so aliases and
+        # list members that point to another domain resolve
+        log "Verifying domains"
+        zmprov gad > "$WORK_DIR/existing_domains"
+        for d in "${DOMAINS[@]}"; do
+            grep -ixF "$d" "$WORK_DIR/existing_domains" > /dev/null || missing_domains+=("$d")
+        done
+        if [ -n "$ALL_DOMAINS" ] && [ -s "$BASE_DIR/alias_domains.txt" ]; then
+            while read -r alias target; do
+                grep -ixF "$alias" "$WORK_DIR/existing_domains" > /dev/null || missing_domains+=("$alias (alias of ${target#@})")
+            done < "$BASE_DIR/alias_domains.txt"
+        fi
+        if [ ${#missing_domains[@]} -gt 0 ]; then
+            log "Domain(s) not found: ${missing_domains[*]}"
+            if ! ask_yn "Do you want to create ${#missing_domains[@]} missing domain(s)?"; then
+                log "Missing domain(s) not created"
                 exit 1
             fi
-            log "Domain $DOMAIN created"
+            for d in "${DOMAINS[@]}"; do
+                grep -ixF "$d" "$WORK_DIR/existing_domains" > /dev/null && continue
+                if ! zmprov cd "$d"; then
+                    log "Failed to create domain $d"
+                    exit 1
+                fi
+                log "Domain $d created"
+            done
+            if [ -n "$ALL_DOMAINS" ] && [ -s "$BASE_DIR/alias_domains.txt" ]; then
+                while read -r alias target; do
+                    grep -ixF "$alias" "$WORK_DIR/existing_domains" > /dev/null && continue
+                    zmprov cd "$alias" zimbraDomainType alias zimbraMailCatchAllAddress "@$alias" \
+                        zimbraMailCatchAllForwardingAddress "$target" &&
+                        log "Alias domain $alias created (forwards to $target)"
+                done < "$BASE_DIR/alias_domains.txt"
+            fi
         else
-            log "Domain $DOMAIN found"
+            log "All domain(s) found"
         fi
     fi
 
     if in_scope mailbox; then
-        if [ ! -d "$BACKUP_DIR/$DIR_MAILBOX" ]; then
-            log "Mailbox backup directory $BACKUP_DIR/$DIR_MAILBOX not found"
-            echo "Please extract the mailbox backup files to $BASE_DIR/"
-            exit 1
-        fi
-        print_version_info "$BACKUP_DIR/$DIR_MAILBOX/backup_version.txt" "Mailbox"
+        for d in "${DOMAINS[@]}"; do
+            if [ ! -d "$BASE_DIR/$d/$DIR_MAILBOX" ]; then
+                log "Mailbox backup directory $BASE_DIR/$d/$DIR_MAILBOX not found"
+                echo "Please extract the mailbox backup files to $BASE_DIR/"
+                exit 1
+            fi
+            print_version_info "$BASE_DIR/$d/$DIR_MAILBOX/backup_version.txt" "$d mailbox"
+        done
         select_method restore
     fi
 
-    log "Restoring $DOMAIN (scope: $SCOPE, jobs: $JOBS)"
+    log "Restoring $TARGET_LABEL (scope: $SCOPE, jobs: $JOBS)"
     if in_scope accounts; then
-        restore_accounts
+        for d in "${DOMAINS[@]}"; do
+            set_domain "$d"
+            log "==== Domain $DOMAIN: accounts"
+            restore_accounts
+        done
+        # Lists after all accounts of all domains, so cross-domain members exist
+        for d in "${DOMAINS[@]}"; do
+            set_domain "$d"
+            restore_dls
+        done
     fi
     if in_scope mailbox; then
-        restore_mailboxes
+        for d in "${DOMAINS[@]}"; do
+            set_domain "$d"
+            log "==== Domain $DOMAIN: mailbox"
+            restore_mailboxes
+        done
     fi
-    log "Restore $DOMAIN ($SCOPE) completed in $(elapsed)"
+    log "Restore $TARGET_LABEL ($SCOPE) completed in $(elapsed)"
 
     if [ "$SCOPE" == "accounts" ]; then
         echo "Next: run backup with scope 2 (mailbox) on the source, then restore with scope 2 here"
         return
     fi
     if ask_yn "Do you want to delete the backup files?"; then
-        rm -rf "$BACKUP_DIR"
+        for d in "${DOMAINS[@]}"; do
+            rm -rf "${BASE_DIR:?}/$d"
+        done
+        if [ -n "$ALL_DOMAINS" ]; then
+            rm -f "$BASE_DIR/domains.txt" "$BASE_DIR/alias_domains.txt"
+        fi
         log "Backup files deleted"
     fi
-    log "All restore process for $DOMAIN completed"
+    log "All restore process for $TARGET_LABEL completed"
 }
 
 backup-delta() {
-    local version_file default_epoch
-    log "[v$SCRIPT_VERSION] Starting delta backup for $DOMAIN"
+    local d input epoch version_file paths=()
+    log "[v$SCRIPT_VERSION] Starting delta backup for $TARGET_LABEL"
     echo "Note: curl cannot set start time. Delta backup uses zmmailbox."
-    if [ ! -s "$BACKUP_DIR/$DIR_EMAILS" ]; then
-        log "Account list $BACKUP_DIR/$DIR_EMAILS not found. Run a full backup first"
-        exit 1
+    if [ -n "$ALL_DOMAINS" ]; then
+        load_backup_domains
+    else
+        DOMAINS=("$DOMAIN")
     fi
-    # Prefer the mailbox backup start time; accounts may have been backed up earlier
-    version_file="$BACKUP_DIR/$DIR_MAILBOX/backup_version.txt"
-    if [ ! -f "$version_file" ]; then
-        version_file="$BACKUP_DIR/backup_version.txt"
-    fi
-    default_epoch=$(sed -n '3p' "$version_file" 2>/dev/null)
+    for d in "${DOMAINS[@]}"; do
+        if [ ! -f "$BASE_DIR/$d/$DIR_EMAILS" ]; then
+            log "Account list $BASE_DIR/$d/$DIR_EMAILS not found. Run a full backup first"
+            exit 1
+        fi
+    done
+
     echo "Please enter the start time as epoch (seconds or milliseconds)"
     echo "Example: 1754913600"
     echo "Get epoch time from https://www.epochconverter.com/"
-    if [ -n "$default_epoch" ]; then
-        echo "Press Enter to use the mailbox backup start time: $default_epoch ($(sed -n '2p' "$version_file"))"
+    if [ -n "$ALL_DOMAINS" ]; then
+        echo "Press Enter to use each domain's mailbox backup start time"
+    else
+        version_file=$(delta_version_file "$DOMAIN")
+        if [ -n "$(sed -n '3p' "$version_file" 2>/dev/null)" ]; then
+            echo "Press Enter to use the mailbox backup start time: $(sed -n '3p' "$version_file") ($(sed -n '2p' "$version_file"))"
+        fi
     fi
-    read -r EPOCH_TIME
-    EPOCH_TIME=${EPOCH_TIME:-$default_epoch}
-    if [[ ! "$EPOCH_TIME" =~ ^[0-9]+$ ]]; then
+    read -r input
+    if [ -n "$input" ] && [[ ! "$input" =~ ^[0-9]+$ ]]; then
         log "A numeric epoch time is required"
         exit 1
     fi
-    # The REST `start` parameter is in milliseconds; convert seconds input
-    if [ ${#EPOCH_TIME} -le 10 ]; then
-        EPOCH_TIME="${EPOCH_TIME}000"
-    fi
-    log "Delta start time (ms): $EPOCH_TIME (jobs: $JOBS)"
 
     export MAILBOX_METHOD="zmmailbox"
-    log "Get all mailbox"
-    mkdir -p "$BACKUP_DIR/$DIR_DELTA"
-    export FAILED_FILE="$BACKUP_DIR/failed_mailbox_delta.txt"
-    : > "$FAILED_FILE"
-    run_each export_mailbox "$BACKUP_DIR/$DIR_EMAILS" "$BACKUP_DIR/$DIR_DELTA" "$EPOCH_TIME"
-    report_failures "Mailbox delta backup"
+    for d in "${DOMAINS[@]}"; do
+        set_domain "$d"
+        epoch=${input:-$(sed -n '3p' "$(delta_version_file "$d")" 2>/dev/null)}
+        if [ -z "$epoch" ]; then
+            log "WARNING: No start time for $d (no mailbox backup found), skipped"
+            continue
+        fi
+        # The REST `start` parameter is in milliseconds; convert seconds input
+        if [ ${#epoch} -le 10 ]; then
+            epoch="${epoch}000"
+        fi
+        log "==== Domain $DOMAIN: delta start time (ms): $epoch (jobs: $JOBS)"
+        mkdir -p "$BACKUP_DIR/$DIR_DELTA"
+        export FAILED_FILE="$BACKUP_DIR/failed_mailbox_delta.txt"
+        : > "$FAILED_FILE"
+        run_each export_mailbox "$BACKUP_DIR/$DIR_EMAILS" "$BACKUP_DIR/$DIR_DELTA" "$epoch"
+        report_failures "Mailbox delta backup"
+        paths+=("$d/$DIR_DELTA")
+    done
     log "Backup Mailbox Delta Completed"
 
-    log "Compressing delta backup files"
-    tar -C "$BASE_DIR" -czf "$BASE_DIR/$DOMAIN-backup-delta.tar.gz" "$DOMAIN/$DIR_DELTA"
-    log "Delta backup files compressed to $BASE_DIR/$DOMAIN-backup-delta.tar.gz in $(elapsed)"
-    echo "Please copy and extract the delta backup files to the target server $BASE_DIR/"
-    echo "Then run: $0 restore-delta $DOMAIN"
+    if [ ${#paths[@]} -gt 0 ]; then
+        if [ -n "$ALL_DOMAINS" ]; then
+            paths+=(domains.txt)
+        fi
+        log "Compressing delta backup files"
+        tar -C "$BASE_DIR" -czf "$BASE_DIR/$ARCHIVE_PREFIX-backup-delta.tar.gz" "${paths[@]}"
+        log "Delta backup files compressed to $BASE_DIR/$ARCHIVE_PREFIX-backup-delta.tar.gz in $(elapsed)"
+        echo "Please copy and extract the delta backup files to the target server $BASE_DIR/"
+        echo "Then run: $0 restore-delta $DOMAIN_ARG"
+    fi
     exit 0
 }
 
 restore-delta() {
-    local accounts
-    log "[v$SCRIPT_VERSION] Starting delta restore for $DOMAIN"
-    if [ ! -d "$BACKUP_DIR/$DIR_DELTA" ]; then
-        log "Delta backup directory $BACKUP_DIR/$DIR_DELTA not found"
-        echo "Please extract the delta backup files to $BASE_DIR/"
+    local d accounts restored=()
+    log "[v$SCRIPT_VERSION] Starting delta restore for $TARGET_LABEL"
+    if [ -n "$ALL_DOMAINS" ]; then
+        load_backup_domains
+    else
+        DOMAINS=("$DOMAIN")
+    fi
+    for d in "${DOMAINS[@]}"; do
+        if [ -d "$BASE_DIR/$d/$DIR_DELTA" ]; then
+            restored+=("$d")
+        elif [ -n "$ALL_DOMAINS" ]; then
+            log "WARNING: No delta backup for $d, skipped"
+        else
+            log "Delta backup directory $BASE_DIR/$d/$DIR_DELTA not found"
+            echo "Please extract the delta backup files to $BASE_DIR/"
+            exit 1
+        fi
+    done
+    if [ ${#restored[@]} -eq 0 ]; then
+        log "No delta backups found in $BASE_DIR"
         exit 1
     fi
-    # The delta archive has no account list; it is derived if the full backup was deleted
-    accounts=$(account_list "$BACKUP_DIR/$DIR_DELTA")
 
     select_method restore
 
-    log "Restoring mailbox for $(count_accounts "$accounts") account(s) (jobs: $JOBS)"
-    export FAILED_FILE="$BACKUP_DIR/failed_mailbox_delta_restore.txt"
-    : > "$FAILED_FILE"
-    run_each import_mailbox "$accounts" "$BACKUP_DIR/$DIR_DELTA"
-    report_failures "Mailbox delta restore"
+    for d in "${restored[@]}"; do
+        set_domain "$d"
+        # The delta archive has no account list; it is derived if the full backup was deleted
+        accounts=$(account_list "$BACKUP_DIR/$DIR_DELTA")
+        log "==== Domain $DOMAIN: restoring delta mailbox for $(count_accounts "$accounts") account(s) (jobs: $JOBS)"
+        export FAILED_FILE="$BACKUP_DIR/failed_mailbox_delta_restore.txt"
+        : > "$FAILED_FILE"
+        run_each import_mailbox "$accounts" "$BACKUP_DIR/$DIR_DELTA"
+        report_failures "Mailbox delta restore"
+    done
     log "Restore Mailbox Delta Completed in $(elapsed)"
 }
 
@@ -821,6 +1282,18 @@ if [ -z "$ACTION" ] || [ -z "$DOMAIN" ]; then
     usage
 fi
 
+# `--all` processes every domain of the server instead of one
+ALL_DOMAINS=""
+DOMAIN_ARG=$DOMAIN
+ARCHIVE_PREFIX=$DOMAIN
+TARGET_LABEL=$DOMAIN
+if [ "$DOMAIN" == "--all" ]; then
+    ALL_DOMAINS=1
+    ARCHIVE_PREFIX="all-domains"
+    TARGET_LABEL="all domains"
+fi
+DOMAINS=()
+
 if [[ ! "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
     echo "Invalid JOBS value '$JOBS', using 1"
     JOBS=1
@@ -828,8 +1301,11 @@ fi
 
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-WORK_DIR=$(mktemp -d) || exit 1
-trap 'rm -rf "$WORK_DIR"' EXIT
+# One scratch directory per domain under WORK_ROOT (see set_domain)
+WORK_ROOT=$(mktemp -d) || exit 1
+trap 'rm -rf "$WORK_ROOT"' EXIT
+WORK_DIR="$WORK_ROOT/main"
+mkdir -p "$WORK_DIR"
 
 case "$ACTION" in
     backup)

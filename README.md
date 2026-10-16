@@ -1,6 +1,6 @@
 # Zimbra Migration Script
 
-`migrate.sh` migrates a whole Zimbra domain from one server to another: accounts, password hashes, mailboxes, aliases, forwarding addresses, signatures, mail filters and distribution lists. Accounts and mailboxes can be migrated separately (accounts first, mailboxes later), and delta (incremental) mailbox sync shortens the cutover window.
+`migrate.sh` migrates one Zimbra domain, or every domain of a server, from one server to another: accounts, password hashes, mailboxes, aliases, forwarding addresses, signatures, mail filters and distribution lists. Accounts and mailboxes can be migrated separately (accounts first, mailboxes later), and delta (incremental) mailbox sync shortens the cutover window.
 
 ## Requirements
 
@@ -13,6 +13,7 @@
 
 ```bash
 ./migrate.sh <action> <domain>
+./migrate.sh <action> --all      # every domain of the server
 ```
 
 | Action          | Runs on | Description                                                          |
@@ -30,8 +31,23 @@
 | `1) accounts` | accounts, password hashes, names, aliases, forwarding, signatures, filters, distribution lists | `<domain>-accounts.tar.gz` |
 | `2) mailbox`  | mailbox content only                                                                      | `<domain>-mailbox.tar`       |
 | `3) all`      | both (default)                                                                            | `<domain>-backup.tar.gz`     |
+| `4) settings` | restore only: signatures and filters re-applied to existing accounts and verified        | –                            |
 
 Restore mailboxes only after the accounts exist on the target.
+
+### Whole server (`--all`)
+
+`--all` runs the action for every domain of the server. Scope, mailbox method and compression are asked once. The archive is named `all-domains-accounts.tar.gz`, `all-domains-mailbox.tar`, `all-domains-backup.tar.gz` or `all-domains-backup-delta.tar.gz`. It contains every domain directory plus `domains.txt` and `alias_domains.txt`, which `restore --all` uses to know which domains to restore. Alias domains are recreated with their catch-all target.
+
+```bash
+# source
+JOBS=4 ./migrate.sh backup --all                 # scope 1, then later scope 2
+# target
+tar -C /opt/zimbra/backup -xzf all-domains-accounts.tar.gz
+JOBS=4 ./migrate.sh restore --all                # scope 1
+tar -C /opt/zimbra/backup -xf all-domains-mailbox.tar
+JOBS=4 ./migrate.sh restore --all                # scope 2
+```
 
 ### Environment variables
 
@@ -75,7 +91,10 @@ See [walkthrough.md](walkthrough.md) for a step-by-step migration guide, and [ch
 ## Notes
 
 - `curl` cannot set a start time, so `backup-delta` always uses `zmmailbox`.
+- Signatures (all of them, HTML and plain text) and filters (incoming and outgoing) are verified on the target after restore. Accounts that still differ are listed in `failed_settings.txt`. To repair accounts migrated with an older version, take a new backup with scope 1 and run `restore` with scope 4.
 - Failed mailbox transfers are listed in `failed_mailbox_<phase>.txt` inside the backup directory.
 - Start with `JOBS=2`–`4` and watch server load; mailbox export/import is I/O and CPU heavy on the mailbox server.
 - Admin rights are not restored automatically. Admin accounts are listed in `admin.txt`; re-grant them with `zmprov ma <user> zimbraIsAdminAccount TRUE`.
+- Server-level configuration (COS, global/server settings, domain settings other than alias domains, certificates, DKIM) is not migrated; set it up on the target before restoring.
+- With `--all`, the server's default domain is included. If the target already has an account with the same address (for example `admin@`), `ca` fails but the backed-up password hash is still applied to that account.
 - System accounts (GAL sync, spam/ham, quarantine) are not migrated. Recreate GAL sync on the target with `zmgsautil createAccount` (see walkthrough.md).
